@@ -1,5 +1,7 @@
-"""Preset data model: a full 70-pin configuration, plus JSON persistence and
-conversion to/from the binary EEPROM blob format (protocol.py)."""
+"""Sidebar entry data model: a full 70-pin configuration for either an
+adopted device (id = its persistent device_id) or an offline draft (id =
+"draft-<hex>"), plus JSON persistence and conversion to/from the binary
+EEPROM blob format (protocol.py). One JSON file per entry, in ENTRIES_DIR."""
 
 import dataclasses
 import json
@@ -8,7 +10,12 @@ from typing import List
 
 import protocol
 
-PRESETS_DIR = Path(__file__).parent / "presets"
+ENTRIES_DIR = Path(__file__).parent / "devices"
+
+# Superseded by ENTRIES_DIR (one JSON per device/draft, no named-preset
+# library) — left in place only so migrate_legacy_presets() can pick up
+# configs saved before that change.
+LEGACY_PRESETS_DIR = Path(__file__).parent / "presets"
 
 
 @dataclasses.dataclass
@@ -66,16 +73,25 @@ class PinConfig:
     def from_dict(d) -> "PinConfig":
         return PinConfig(**d)
 
+    @staticmethod
+    def equal(a: "PinConfig", b: "PinConfig") -> bool:
+        return dataclasses.astuple(a) == dataclasses.astuple(b)
+
 
 @dataclasses.dataclass
-class Preset:
-    name: str
+class Entry:
+    id: str  # str(device_id) for a device entry, "draft-<hex>" for a draft
+    entry_type: str  # "device" | "draft"
+    nickname: str
     pins: List[PinConfig] = dataclasses.field(default_factory=list)
-    device_id: int = 0  # 0 = unassigned; set on the device via SET_DEVICE_ID, not by writing a preset
+    device_id: int = 0  # meaningful only when entry_type == "device"
 
     @staticmethod
-    def blank(name: str) -> "Preset":
-        return Preset(name=name, pins=[PinConfig(pin=i) for i in range(protocol.PIN_COUNT)])
+    def blank(id_: str, entry_type: str, nickname: str, device_id: int = 0) -> "Entry":
+        return Entry(
+            id=id_, entry_type=entry_type, nickname=nickname, device_id=device_id,
+            pins=[PinConfig(pin=i) for i in range(protocol.PIN_COUNT)],
+        )
 
     def to_blob(self) -> bytes:
         by_pin = {p.pin: p for p in self.pins}
@@ -83,39 +99,73 @@ class Preset:
         return protocol.build_config_blob(tuples, device_id=self.device_id)
 
     @staticmethod
-    def from_blob(name: str, blob: bytes) -> "Preset":
+    def from_blob(id_: str, nickname: str, blob: bytes) -> "Entry":
         device_id, tuples = protocol.parse_config_blob(blob)
         pins = [PinConfig.from_tuple(i, t) for i, t in enumerate(tuples)]
-        return Preset(name=name, pins=pins, device_id=device_id)
+        return Entry(id=id_, entry_type="device", nickname=nickname, pins=pins, device_id=device_id)
 
     def to_dict(self):
         return {
-            "name": self.name,
-            "pins": [p.to_dict() for p in self.pins],
+            "id": self.id,
+            "entry_type": self.entry_type,
+            "nickname": self.nickname,
             "device_id": self.device_id,
+            "pins": [p.to_dict() for p in self.pins],
         }
 
     @staticmethod
-    def from_dict(d) -> "Preset":
-        return Preset(
-            name=d["name"],
-            pins=[PinConfig.from_dict(p) for p in d["pins"]],
+    def from_dict(d) -> "Entry":
+        return Entry(
+            id=d["id"],
+            entry_type=d.get("entry_type", "device"),
+            nickname=d.get("nickname", d["id"]),
             device_id=d.get("device_id", 0),
+            pins=[PinConfig.from_dict(p) for p in d["pins"]],
         )
 
-    def save(self, directory: Path = PRESETS_DIR) -> Path:
+    @staticmethod
+    def _path(id_: str, directory: Path = ENTRIES_DIR) -> Path:
+        return directory / f"{id_}.json"
+
+    def save(self, directory: Path = ENTRIES_DIR) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{self.name}.json"
+        path = self._path(self.id, directory)
         path.write_text(json.dumps(self.to_dict(), indent=2))
         return path
 
     @staticmethod
-    def load(name: str, directory: Path = PRESETS_DIR) -> "Preset":
-        path = directory / f"{name}.json"
-        return Preset.from_dict(json.loads(path.read_text()))
+    def load(id_: str, directory: Path = ENTRIES_DIR) -> "Entry":
+        return Entry.from_dict(json.loads(Entry._path(id_, directory).read_text()))
 
     @staticmethod
-    def list_presets(directory: Path = PRESETS_DIR) -> List[str]:
+    def exists(id_: str, directory: Path = ENTRIES_DIR) -> bool:
+        return Entry._path(id_, directory).exists()
+
+    @staticmethod
+    def delete(id_: str, directory: Path = ENTRIES_DIR) -> None:
+        path = Entry._path(id_, directory)
+        if path.exists():
+            path.unlink()
+
+    @staticmethod
+    def list_ids(directory: Path = ENTRIES_DIR) -> List[str]:
         if not directory.exists():
             return []
         return sorted(p.stem for p in directory.glob("*.json"))
+
+
+def migrate_legacy_presets() -> None:
+    """One-time upgrade path: fold any *.json files left over from the old
+    named-preset library into drafts, since that library no longer exists.
+    No-op once ENTRIES_DIR has been created."""
+    if ENTRIES_DIR.exists() or not LEGACY_PRESETS_DIR.exists():
+        return
+    ENTRIES_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(LEGACY_PRESETS_DIR.glob("*.json")):
+        try:
+            d = json.loads(path.read_text())
+            pins = [PinConfig.from_dict(p) for p in d["pins"]]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        draft_id = f"draft-{path.stem}"
+        Entry(id=draft_id, entry_type="draft", nickname=d.get("name", path.stem), pins=pins).save()

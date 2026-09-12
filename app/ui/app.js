@@ -14,6 +14,7 @@ function api(name, ...args) {
 const PWM_PINS = new Set([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 44, 45, 46]);
 const RESERVED_PINS = new Set([0, 1, 13]);
 const PIN_COUNT = 70;
+const ALL_DEVICES_ID = "__all__";
 
 const ROLE_LABELS = {
   unused: "Unused",
@@ -132,37 +133,25 @@ function pinLabel(pin) {
 // ---- app state -----------------------------------------------------------
 
 const state = {
-  pins: [], // array of PIN_COUNT pin config objects — one shared editing buffer
-  presetName: "untitled",
+  entries: [], // sidebar entries from list_entries(): {id, entry_type, nickname, device_id, connected, in_sync}
+  selectedId: null, // an entry id, or ALL_DEVICES_ID, or null before first load
+  pins: [], // array of PIN_COUNT pin config objects for the selected entry
   selectedPin: null,
-  devices: {}, // port -> status dict from list_devices()
-  targetPort: null, // which connected device Read/Write/Flash/Assign-ID act on
   view: "table",
   monitorRows: 0,
+  addDevicePorts: null, // non-null while the "+ Device" port picker is open
+  reconnectingId: null, // entry id whose inline "connect to port" picker is open
+  reconnectPorts: [],
 };
 
-function blankPins() {
-  const pins = [];
-  for (let i = 0; i < PIN_COUNT; i++) {
-    pins.push({
-      pin: i,
-      role: "unused",
-      channel: 0,
-      number: 0,
-      in_min: 0,
-      in_max: 0,
-      out_min: 0,
-      out_max: 0,
-      invert: false,
-      toggle: false,
-      match_cc: false,
-    });
-  }
-  return pins;
-}
+let saveTimer = null;
 
 function pinByIndex(i) {
   return state.pins[i];
+}
+
+function selectedEntry() {
+  return state.entries.find((e) => e.id === state.selectedId) || null;
 }
 
 // ---- role assignment (handles encoder pairing) ---------------------------
@@ -188,6 +177,7 @@ function setPinRole(pin, role) {
     }
   }
 
+  scheduleAutoSave();
   renderAll();
 }
 
@@ -201,6 +191,30 @@ function setPinField(pin, field, value) {
   ) {
     pinByIndex(pin + 1)[field] = value;
   }
+  scheduleAutoSave();
+}
+
+// ---- auto-save -------------------------------------------------------------
+
+function scheduleAutoSave() {
+  if (!state.selectedId || state.selectedId === ALL_DEVICES_ID) return;
+  const id = state.selectedId;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    const pinsSnapshot = state.pins.map((p) => ({ ...p }));
+    const status = await api("update_entry_pins", id, pinsSnapshot);
+    applyEntryStatus(status);
+  }, 400);
+}
+
+function applyEntryStatus(status) {
+  if (!status) return;
+  const entry = state.entries.find((e) => e.id === status.id);
+  if (!entry) return;
+  if ("connected" in status) entry.connected = status.connected;
+  if ("in_sync" in status) entry.in_sync = status.in_sync;
+  renderSidebar();
+  renderHeader();
 }
 
 // ---- rendering: table view -------------------------------------------------
@@ -624,12 +638,328 @@ function renderEncoderShiftFields(pin, p, fields) {
   }
 }
 
-// ---- top-level render ------------------------------------------------------
+// ---- sidebar ----------------------------------------------------------------
 
-function renderAll() {
-  renderTable();
-  renderBoard();
-  renderEditor();
+function sortedEntries() {
+  const devices = state.entries
+    .filter((e) => e.entry_type === "device")
+    .sort((a, b) => a.device_id - b.device_id);
+  const drafts = state.entries
+    .filter((e) => e.entry_type === "draft")
+    .sort((a, b) => a.nickname.localeCompare(b.nickname));
+  return [...devices, ...drafts];
+}
+
+function statusDotClass(entry) {
+  if (entry.entry_type === "draft") return "dot draft";
+  if (!entry.connected) return "dot offline";
+  if (entry.in_sync === false) return "dot out-of-sync";
+  return "dot in-sync";
+}
+
+function statusDotTitle(entry) {
+  if (entry.entry_type === "draft") return "Draft (no device attached)";
+  if (!entry.connected) return "Offline";
+  if (entry.in_sync === false) return "Connected — out of sync with the device";
+  return "Connected — in sync with the device";
+}
+
+function renderSidebar() {
+  const list = document.getElementById("entryList");
+  list.innerHTML = "";
+
+  const allRow = document.createElement("div");
+  allRow.className = "entry-row all-devices" + (state.selectedId === ALL_DEVICES_ID ? " selected" : "");
+  allRow.textContent = "All devices";
+  allRow.title = "Show MIDI traffic from every connected device";
+  allRow.addEventListener("click", () => selectEntry(ALL_DEVICES_ID));
+  list.appendChild(allRow);
+
+  sortedEntries().forEach((entry) => {
+    const row = document.createElement("div");
+    row.className = "entry-row" + (state.selectedId === entry.id ? " selected" : "");
+
+    const dot = document.createElement("span");
+    dot.className = statusDotClass(entry);
+    dot.title = statusDotTitle(entry);
+    row.appendChild(dot);
+
+    const name = document.createElement("span");
+    name.className = "entry-name";
+    name.textContent = entry.nickname;
+    row.appendChild(name);
+
+    if (entry.entry_type === "device") {
+      const idTag = document.createElement("span");
+      idTag.className = "entry-id";
+      idTag.textContent = `#${entry.device_id}`;
+      row.appendChild(idTag);
+    } else {
+      const tag = document.createElement("span");
+      tag.className = "entry-id";
+      tag.textContent = "draft";
+      row.appendChild(tag);
+    }
+
+    if (entry.entry_type === "device" && !entry.connected) {
+      const connectBtn = document.createElement("button");
+      connectBtn.className = "entry-action";
+      connectBtn.textContent = "Connect";
+      connectBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleReconnectPicker(entry.id);
+      });
+      row.appendChild(connectBtn);
+    }
+
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "entry-action";
+    renameBtn.textContent = "✎";
+    renameBtn.title = "Rename";
+    renameBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      renameEntry(entry.id, entry.nickname);
+    });
+    row.appendChild(renameBtn);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "entry-action";
+    removeBtn.textContent = "✕";
+    removeBtn.title = "Remove";
+    removeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeEntry(entry.id);
+    });
+    row.appendChild(removeBtn);
+
+    row.addEventListener("click", () => selectEntry(entry.id));
+    list.appendChild(row);
+
+    if (state.reconnectingId === entry.id) {
+      list.appendChild(buildPortPicker(state.reconnectPorts, (port) => reconnectEntry(entry.id, port)));
+    }
+  });
+
+  renderAddDevicePicker();
+}
+
+function buildPortPicker(ports, onPick) {
+  const wrap = document.createElement("div");
+  wrap.className = "port-picker";
+  if (ports.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "port-picker-empty";
+    empty.textContent = "No serial ports found.";
+    wrap.appendChild(empty);
+    return wrap;
+  }
+  ports.forEach((port) => {
+    const btn = document.createElement("button");
+    btn.textContent = port;
+    btn.addEventListener("click", () => onPick(port));
+    wrap.appendChild(btn);
+  });
+  return wrap;
+}
+
+function renderAddDevicePicker() {
+  const container = document.getElementById("addDevicePicker");
+  container.innerHTML = "";
+  container.hidden = state.addDevicePorts === null;
+  if (state.addDevicePorts === null) return;
+  container.appendChild(buildPortPicker(state.addDevicePorts, adoptPort));
+}
+
+async function toggleAddDevicePicker() {
+  if (state.addDevicePorts !== null) {
+    state.addDevicePorts = null;
+  } else {
+    state.addDevicePorts = await api("list_ports");
+  }
+  renderSidebar();
+}
+
+async function adoptPort(port) {
+  state.addDevicePorts = null;
+  const entry = await api("adopt_port", port);
+  await refreshEntries();
+  if (entry) await selectEntry(entry.id);
+}
+
+async function createDraft() {
+  const name = prompt("Draft name:", "Untitled draft");
+  if (name === null) return;
+  const entry = await api("create_draft", name);
+  await refreshEntries();
+  await selectEntry(entry.id);
+}
+
+async function renameEntry(id, currentName) {
+  const name = prompt("Rename to:", currentName);
+  if (name === null || !name.trim()) return;
+  await api("rename_entry", id, name.trim());
+  await refreshEntries();
+}
+
+async function removeEntry(id) {
+  if (!confirm("Remove this entry? This deletes its saved config permanently.")) return;
+  await api("remove_entry", id);
+  const wasSelected = state.selectedId === id;
+  await refreshEntries();
+  if (wasSelected) {
+    const first = sortedEntries()[0];
+    await selectEntry(first ? first.id : ALL_DEVICES_ID);
+  }
+}
+
+async function toggleReconnectPicker(id) {
+  if (state.reconnectingId === id) {
+    state.reconnectingId = null;
+  } else {
+    state.reconnectingId = id;
+    state.reconnectPorts = await api("list_ports");
+  }
+  renderSidebar();
+}
+
+async function reconnectEntry(id, port) {
+  state.reconnectingId = null;
+  const result = await api("reconnect_entry", id, port);
+  if (!result.ok) alert("Could not reconnect: " + result.error);
+  await refreshEntries();
+  if (state.selectedId === id) await selectEntry(id);
+}
+
+async function refreshEntries() {
+  state.entries = await api("list_entries");
+  renderSidebar();
+  renderHeader();
+}
+
+// ---- header (per-entry actions) ---------------------------------------------
+
+function renderHeader() {
+  const el = document.getElementById("entryHeader");
+  const prevApplySelect = el.querySelector(".eh-apply-select");
+  const prevApplyValue = prevApplySelect ? prevApplySelect.value : null;
+  el.innerHTML = "";
+  const entry = selectedEntry();
+
+  if (!entry) {
+    el.textContent = state.selectedId === ALL_DEVICES_ID ? "Showing MIDI traffic from all devices" : "";
+    return;
+  }
+
+  const name = document.createElement("span");
+  name.className = "eh-name";
+  name.textContent = entry.nickname;
+  el.appendChild(name);
+
+  if (entry.entry_type === "device") {
+    const badge = document.createElement("span");
+    badge.className = "eh-badge " + (entry.connected ? "online" : "offline");
+    badge.textContent = entry.connected ? "Online" : "Offline";
+    el.appendChild(badge);
+
+    const readBtn = document.createElement("button");
+    readBtn.textContent = "Read from device";
+    readBtn.disabled = !entry.connected;
+    readBtn.addEventListener("click", readFromDevice);
+    el.appendChild(readBtn);
+
+    const writeBtn = document.createElement("button");
+    writeBtn.id = "writeBtn";
+    writeBtn.textContent = "Write to device";
+    writeBtn.disabled = !entry.connected;
+    writeBtn.className =
+      entry.connected && entry.in_sync === false ? "out-of-sync" : "";
+    writeBtn.addEventListener("click", writeToDevice);
+    el.appendChild(writeBtn);
+
+    const flashBtn = document.createElement("button");
+    flashBtn.textContent = "Flash firmware";
+    flashBtn.disabled = !entry.connected;
+    flashBtn.addEventListener("click", flashFirmware);
+    el.appendChild(flashBtn);
+  } else {
+    const applyLabel = document.createElement("label");
+    applyLabel.className = "inline-label";
+    applyLabel.textContent = "Apply to:";
+    const select = document.createElement("select");
+    select.className = "eh-apply-select";
+    const devices = state.entries.filter((e) => e.entry_type === "device");
+    if (devices.length === 0) {
+      const opt = document.createElement("option");
+      opt.textContent = "(no devices adopted yet)";
+      select.appendChild(opt);
+      select.disabled = true;
+    } else {
+      devices.forEach((d) => {
+        const opt = document.createElement("option");
+        opt.value = d.id;
+        opt.textContent = d.nickname;
+        select.appendChild(opt);
+      });
+      if (devices.some((d) => d.id === prevApplyValue)) select.value = prevApplyValue;
+    }
+    applyLabel.appendChild(select);
+    el.appendChild(applyLabel);
+
+    const applyBtn = document.createElement("button");
+    applyBtn.textContent = "Apply";
+    applyBtn.disabled = devices.length === 0;
+    applyBtn.addEventListener("click", () => applyDraftToDevice(entry.id, select.value));
+    el.appendChild(applyBtn);
+  }
+}
+
+async function applyDraftToDevice(draftId, deviceId) {
+  if (!deviceId) return;
+  await api("apply_draft", draftId, deviceId);
+  await refreshEntries();
+}
+
+// ---- entry selection / editing buffer ---------------------------------------
+
+async function selectEntry(id) {
+  state.selectedId = id;
+  state.selectedPin = null;
+  if (id === ALL_DEVICES_ID) {
+    state.pins = [];
+  } else {
+    const dict = await api("get_entry", id);
+    state.pins = dict.pins;
+  }
+  renderAll();
+}
+
+async function readFromDevice() {
+  const id = state.selectedId;
+  const dict = await api("read_device_config", id);
+  await refreshEntries();
+  if (!dict) {
+    alert("Failed to read config from device.");
+    return;
+  }
+  if (state.selectedId === id) {
+    state.pins = dict.pins;
+    state.selectedPin = null;
+    renderAll();
+  }
+}
+
+async function writeToDevice() {
+  const id = state.selectedId;
+  const ok = await api("write_device_config", id);
+  await refreshEntries();
+  if (!ok) alert("Write failed (version/checksum mismatch?).");
+}
+
+async function flashFirmware() {
+  const id = state.selectedId;
+  if (!confirm("Flash firmware to this device? This takes a few seconds.")) return;
+  const result = await api("flash_firmware", id);
+  alert(result.ok ? "Flash succeeded." : "Flash failed:\n\n" + result.output);
 }
 
 // ---- monitor ---------------------------------------------------------------
@@ -655,7 +985,7 @@ function appendMonitorRow(evt) {
 
   const dev = document.createElement("span");
   dev.className = "dev";
-  dev.textContent = evt.device_id ? `Device ${evt.device_id}` : evt.port;
+  dev.textContent = evt.device_id ? `Device ${evt.device_id}` : "?";
 
   const decoded = document.createElement("span");
   decoded.className = "decoded";
@@ -693,250 +1023,32 @@ function flashPin(pin, value) {
   });
 }
 
-// ---- connection / presets / device actions ---------------------------------
+// ---- top-level render ------------------------------------------------------
 
-async function refreshPorts() {
-  const select = document.getElementById("portSelect");
-  const ports = await api("list_ports");
-  const current = select.value;
-  select.innerHTML = "";
-  ports.forEach((p) => {
-    const opt = document.createElement("option");
-    opt.value = p;
-    opt.textContent = p;
-    select.appendChild(opt);
-  });
-  if (ports.includes(current)) select.value = current;
-}
-
-async function refreshPresets() {
-  const select = document.getElementById("presetSelect");
-  const presets = await api("list_presets");
-  select.innerHTML = "";
-  const blank = document.createElement("option");
-  blank.value = "";
-  blank.textContent = "(load preset...)";
-  select.appendChild(blank);
-  presets.forEach((name) => {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = name;
-    select.appendChild(opt);
-  });
-}
-
-function deviceLabel(status) {
-  return status.device_id ? `Device ${status.device_id}` : `Unassigned`;
-}
-
-async function refreshDevices() {
-  const list = await api("list_devices");
-  state.devices = {};
-  list.forEach((d) => {
-    state.devices[d.port] = d;
-  });
-
-  if (!state.targetPort || !state.devices[state.targetPort]) {
-    const ports = Object.keys(state.devices);
-    state.targetPort = ports.length ? ports[0] : null;
+function renderAll() {
+  const entry = selectedEntry();
+  const hasConfig = !!entry;
+  document.getElementById("main").hidden = !hasConfig;
+  document.getElementById("mainEmpty").hidden = hasConfig;
+  if (hasConfig) {
+    renderTable();
+    renderBoard();
+    renderEditor();
   }
-  renderDeviceBar();
-}
-
-function renderDeviceBar() {
-  const list = document.getElementById("deviceList");
-  list.innerHTML = "";
-  const ports = Object.keys(state.devices);
-
-  if (ports.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "device-empty";
-    empty.textContent =
-      "No devices connected — pick a port above and click Connect.";
-    list.appendChild(empty);
-    return;
-  }
-
-  ports.forEach((port) => {
-    const d = state.devices[port];
-    const chip = document.createElement("div");
-    chip.className =
-      "device-chip" + (port === state.targetPort ? " target" : "");
-
-    const name = document.createElement("span");
-    name.className = "dc-name";
-    name.textContent = deviceLabel(d);
-    chip.appendChild(name);
-
-    const mode = document.createElement("span");
-    mode.className = "dc-mode " + (d.mode === "config" ? "config" : "run");
-    mode.textContent = d.mode || "run";
-    chip.appendChild(mode);
-
-    const portLabel = document.createElement("span");
-    portLabel.className = "dc-port";
-    portLabel.textContent = port;
-    chip.appendChild(portLabel);
-
-    chip.addEventListener("click", (e) => {
-      if (e.target.closest("button, input")) return;
-      state.targetPort = port;
-      renderDeviceBar();
-    });
-
-    if (!d.device_id) {
-      const idLabel = document.createElement("label");
-      idLabel.className = "inline-label";
-      idLabel.textContent = "New ID:";
-      const idInput = document.createElement("input");
-      idInput.type = "number";
-      idInput.min = 1;
-      idInput.max = 255;
-      idInput.title = "Device ID to assign (1-255)";
-      idLabel.appendChild(idInput);
-      const assignBtn = document.createElement("button");
-      assignBtn.textContent = "Assign ID";
-      assignBtn.addEventListener("click", async () => {
-        const id = parseInt(idInput.value, 10);
-        if (!id || id < 1 || id > 255) return;
-        const ok = await api("assign_device_id", port, id);
-        if (!ok) alert("Failed to assign device id.");
-        await refreshDevices();
-      });
-      chip.appendChild(idLabel);
-      chip.appendChild(assignBtn);
-    }
-
-    const disconnectBtn = document.createElement("button");
-    disconnectBtn.textContent = "✕";
-    disconnectBtn.title = "Disconnect";
-    disconnectBtn.addEventListener("click", async () => {
-      await api("disconnect", port);
-      await refreshDevices();
-    });
-    chip.appendChild(disconnectBtn);
-
-    list.appendChild(chip);
-  });
-}
-
-async function connectDevice() {
-  const port = document.getElementById("portSelect").value;
-  if (!port) return;
-  await api("connect", port);
-  await refreshDevices();
-}
-
-function pinsToDict() {
-  return { name: state.presetName, pins: state.pins.map((p) => ({ ...p })) };
-}
-
-function loadPinsFromDict(dict) {
-  state.presetName = dict.name;
-  state.pins = dict.pins;
-  document.getElementById("presetNameInput").value = state.presetName;
-  state.selectedPin = null;
-  renderAll();
-}
-
-function requireTarget() {
-  if (!state.targetPort) {
-    alert(
-      "No target device selected — connect a Mega and select it in the device list first.",
-    );
-    return null;
-  }
-  return state.targetPort;
-}
-
-async function readFromDevice() {
-  const port = requireTarget();
-  if (!port) return;
-  const ok = await api("enter_config", port);
-  if (!ok) {
-    alert("Could not enter config mode — is the device connected?");
-    return;
-  }
-  const dict = await api("read_device_config", port);
-  await api("resume_run", port);
-  await refreshDevices();
-  if (dict) loadPinsFromDict(dict);
-  else alert("Failed to read config from device.");
-}
-
-async function writeToDevice() {
-  const port = requireTarget();
-  if (!port) return;
-  const ok = await api("enter_config", port);
-  if (!ok) {
-    alert("Could not enter config mode — is the device connected?");
-    return;
-  }
-  const success = await api("write_device_config", port, pinsToDict());
-  await api("resume_run", port);
-  await refreshDevices();
-  alert(
-    success
-      ? "Config written to device."
-      : "Write failed (version/checksum mismatch?).",
-  );
-}
-
-async function flashFirmware() {
-  const port = requireTarget();
-  if (!port) return;
-  if (
-    !confirm(`Flash firmware to the Mega on ${port}? This takes a few seconds.`)
-  )
-    return;
-  const result = await api("flash_firmware", port);
-  alert(result.ok ? "Flash succeeded." : "Flash failed:\n\n" + result.output);
+  renderSidebar();
+  renderHeader();
 }
 
 // ---- wiring -----------------------------------------------------------------
 
 function initEventListeners() {
-  document
-    .getElementById("refreshPortsBtn")
-    .addEventListener("click", refreshPorts);
-  document
-    .getElementById("connectBtn")
-    .addEventListener("click", connectDevice);
-  document
-    .getElementById("readConfigBtn")
-    .addEventListener("click", readFromDevice);
-  document
-    .getElementById("writeConfigBtn")
-    .addEventListener("click", writeToDevice);
-  document.getElementById("flashBtn").addEventListener("click", flashFirmware);
+  document.getElementById("addDeviceBtn").addEventListener("click", toggleAddDevicePicker);
+  document.getElementById("addDraftBtn").addEventListener("click", createDraft);
+
   document.getElementById("clearMonitorBtn").addEventListener("click", () => {
     document.getElementById("monitorLog").innerHTML = "";
     state.monitorRows = 0;
   });
-
-  document.getElementById("newPresetBtn").addEventListener("click", () => {
-    const name =
-      document.getElementById("presetNameInput").value.trim() || "untitled";
-    loadPinsFromDict({ name, pins: blankPins() });
-  });
-
-  document
-    .getElementById("savePresetBtn")
-    .addEventListener("click", async () => {
-      state.presetName =
-        document.getElementById("presetNameInput").value.trim() || "untitled";
-      await api("save_preset", pinsToDict());
-      await refreshPresets();
-    });
-
-  document
-    .getElementById("presetSelect")
-    .addEventListener("change", async (e) => {
-      if (!e.target.value) return;
-      const dict = await api("load_preset", e.target.value);
-      loadPinsFromDict(dict);
-      await refreshPresets();
-    });
 
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -953,25 +1065,28 @@ function initEventListeners() {
     });
   });
 
-  window.addEventListener("monitor_event", (e) => appendMonitorRow(e.detail));
+  window.addEventListener("monitor_event", (e) => {
+    const evt = e.detail;
+    if (state.selectedId !== ALL_DEVICES_ID) {
+      const entry = selectedEntry();
+      if (!entry || entry.entry_type !== "device" || evt.device_id !== entry.device_id) return;
+    }
+    appendMonitorRow(evt);
+  });
+
   window.addEventListener("pin_activity", (e) => {
-    // Only reflect activity from whichever device is currently selected as
-    // the edit target, so pins from an unrelated second device don't flash.
-    if (e.detail.port !== state.targetPort) return;
+    const entry = selectedEntry();
+    if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
     e.detail.pins.forEach(({ pin, value }) => flashPin(pin, value));
   });
 }
 
 async function init() {
   initEventListeners();
-  state.pins = blankPins();
-  document.getElementById("presetNameInput").value = state.presetName;
-  renderAll();
-
-  await refreshPorts();
-  await refreshPresets();
-  await refreshDevices();
-  setInterval(refreshDevices, 1500);
+  await refreshEntries();
+  const first = sortedEntries()[0];
+  await selectEntry(first ? first.id : ALL_DEVICES_ID);
+  setInterval(refreshEntries, 1500);
 }
 
 window.addEventListener("pywebviewready", init);

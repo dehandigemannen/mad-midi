@@ -5,6 +5,7 @@ multi-device design this implements."""
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -27,6 +28,12 @@ def _virtual_port_names(port: str, device_id: int):
     return f"{label} Out", f"{label} In"
 
 
+def _pins_equal(a, b) -> bool:
+    if a is None or b is None or len(a) != len(b):
+        return False
+    return all(config_model.PinConfig.equal(x, y) for x, y in zip(a, b))
+
+
 class DeviceSession:
     def __init__(self, port: str, api: "Api"):
         self.port = port
@@ -34,6 +41,7 @@ class DeviceSession:
         self.fw_version = None
         self.config_format_version = None
         self.active_pins = None  # list[config_model.PinConfig] once known
+        self.baseline_pins = None  # snapshot of what's actually flashed to the device
 
         self._api = api
         self.link = serial_link.SerialLink(
@@ -65,16 +73,6 @@ class DeviceSession:
         self.link.disconnect()
         self.bridge.close()
 
-    def status(self):
-        return {
-            "port": self.port,
-            "connected": self.link.connected,
-            "mode": self.link.mode,
-            "device_id": self.device_id,
-            "fw_version": self.fw_version,
-            "config_format_version": self.config_format_version,
-        }
-
     def _on_device_midi(self, raw: bytes):
         self.bridge.send_to_daw(raw)
 
@@ -83,7 +81,6 @@ class DeviceSession:
 
     def _on_monitor(self, direction, kind, raw: bytes):
         self._api._emit("monitor_event", {
-            "port": self.port,
             "device_id": self.device_id,
             "direction": direction,
             "kind": kind,
@@ -93,7 +90,7 @@ class DeviceSession:
         if kind == "midi":
             matches = self._match_pins(direction, raw)
             if matches:
-                self._api._emit("pin_activity", {"port": self.port, "direction": direction, "pins": matches})
+                self._api._emit("pin_activity", {"device_id": self.device_id, "direction": direction, "pins": matches})
 
     def _match_pins(self, direction, raw: bytes):
         if not self.active_pins or len(raw) < 3:
@@ -114,103 +111,240 @@ class DeviceSession:
 class Api:
     def __init__(self):
         self._window: Optional[webview.Window] = None
-        self._devices: Dict[str, DeviceSession] = {}
+        self._devices: Dict[str, DeviceSession] = {}  # port -> session, only while connected
+        self._device_ports: Dict[int, str] = {}  # device_id -> port, only while connected
+        config_model.migrate_legacy_presets()
 
     def set_window(self, window):
         self._window = window
 
-    # ---- device lifecycle -----------------------------------------------
+    def _session_for_device(self, device_id: int) -> Optional[DeviceSession]:
+        port = self._device_ports.get(device_id)
+        return self._devices.get(port) if port else None
+
+    def _entry_status(self, entry: config_model.Entry):
+        result = {"id": entry.id}
+        if entry.entry_type == "device":
+            session = self._session_for_device(entry.device_id)
+            connected = bool(session and session.link.connected)
+            result["connected"] = connected
+            result["in_sync"] = (
+                _pins_equal(session.baseline_pins, entry.pins)
+                if connected and session.baseline_pins is not None
+                else None
+            )
+        return result
+
+    # ---- sidebar entries (devices + drafts) -------------------------------
+
+    def list_entries(self):
+        entries = []
+        for id_ in config_model.Entry.list_ids():
+            try:
+                entry = config_model.Entry.load(id_)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+            info = {
+                "id": entry.id,
+                "entry_type": entry.entry_type,
+                "nickname": entry.nickname,
+                "device_id": entry.device_id,
+            }
+            info.update(self._entry_status(entry))
+            entries.append(info)
+        return entries
+
+    def get_entry(self, id_: str):
+        return config_model.Entry.load(id_).to_dict()
+
+    def create_draft(self, nickname: str):
+        draft_id = f"draft-{uuid.uuid4().hex[:8]}"
+        entry = config_model.Entry.blank(draft_id, "draft", nickname.strip() or "Untitled draft")
+        entry.save()
+        return entry.to_dict()
+
+    def rename_entry(self, id_: str, nickname: str):
+        entry = config_model.Entry.load(id_)
+        entry.nickname = nickname.strip() or entry.nickname
+        entry.save()
+        return entry.to_dict()
+
+    def remove_entry(self, id_: str):
+        entry = config_model.Entry.load(id_)
+        if entry.entry_type == "device":
+            port = self._device_ports.pop(entry.device_id, None)
+            session = self._devices.pop(port, None) if port else None
+            if session:
+                session.close()
+        config_model.Entry.delete(id_)
+        return True
+
+    def update_entry_pins(self, id_: str, pins_dicts):
+        """Debounced auto-save call fired from the UI on every edit."""
+        entry = config_model.Entry.load(id_)
+        entry.pins = [config_model.PinConfig.from_dict(p) for p in pins_dicts]
+        entry.save()
+        session = self._session_for_device(entry.device_id) if entry.entry_type == "device" else None
+        if session:
+            session.active_pins = entry.pins
+        return self._entry_status(entry)
+
+    def apply_draft(self, draft_id: str, device_entry_id: str):
+        draft = config_model.Entry.load(draft_id)
+        device_entry = config_model.Entry.load(device_entry_id)
+        device_entry.pins = draft.pins
+        device_entry.save()
+        session = self._session_for_device(device_entry.device_id)
+        if session:
+            session.active_pins = device_entry.pins
+        return self._entry_status(device_entry)
+
+    # ---- device adoption ----------------------------------------------
 
     def list_ports(self):
-        return serial_link.SerialLink.list_ports()
+        connected_ports = set(self._devices.keys())
+        return [p for p in serial_link.SerialLink.list_ports() if p not in connected_ports]
 
-    def list_devices(self):
-        return [d.status() for d in self._devices.values()]
+    def _next_free_device_id(self) -> int:
+        used = {int(i) for i in config_model.Entry.list_ids() if i.isdigit()}
+        for candidate in range(1, 256):
+            if candidate not in used:
+                return candidate
+        return 0
 
-    def connect(self, port: str):
-        if port in self._devices:
-            return self._devices[port].status()
+    def adopt_port(self, port: str):
+        """Connect a freshly-plugged board: identify it, auto-assign a
+        device id if it doesn't have one yet, and attach a live session.
+
+        If this device_id was never adopted before, its saved buffer is
+        seeded from whatever's currently on its EEPROM (there's nothing
+        else to seed it from). If it's already a known entry (e.g. it was
+        adopted from a different port previously), its saved buffer —
+        including any edits made while it was offline — is left untouched;
+        only the in-memory sync baseline is (re)established from the
+        device's actual EEPROM contents, same as reconnect_entry."""
         session = DeviceSession(port, self)
-        self._devices[port] = session
         session.identify()
-        return session.status()
 
-    def disconnect(self, port: str):
-        session = self._devices.pop(port, None)
+        if session.device_id == 0:
+            new_id = self._next_free_device_id()
+            if session.link.enter_config_mode():
+                if session.link.set_device_id(new_id):
+                    session.device_id = new_id
+                    session._rebuild_bridge()
+                session.link.resume_run_mode()
+
+        device_id = session.device_id
+        if device_id == 0:
+            session.close()
+            return None
+
+        id_ = str(device_id)
+        self._devices[port] = session
+        self._device_ports[device_id] = port
+
+        blob = None
+        if session.link.enter_config_mode():
+            blob = session.link.read_config()
+            session.link.resume_run_mode()
+
+        if config_model.Entry.exists(id_):
+            entry = config_model.Entry.load(id_)
+        else:
+            nickname = f"Device {device_id}"
+            entry = (
+                config_model.Entry.from_blob(id_, nickname, blob)
+                if blob is not None
+                else config_model.Entry.blank(id_, "device", nickname, device_id=device_id)
+            )
+            entry.save()
+
+        session.baseline_pins = (
+            config_model.Entry.from_blob(id_, entry.nickname, blob).pins if blob is not None else None
+        )
+        session.active_pins = entry.pins
+        return entry.to_dict()
+
+    def reconnect_entry(self, id_: str, port: str):
+        """Re-establish a live connection for an adopted device that's back
+        online on `port`, verifying it's actually the same board. Only
+        refreshes the in-memory sync baseline from the device's actual
+        EEPROM contents — the saved buffer (and any edits made while it was
+        offline) is left untouched; use "Read from device" to pull the
+        device's contents into the buffer explicitly."""
+        entry = config_model.Entry.load(id_)
+        if entry.entry_type != "device":
+            return {"ok": False, "error": "not a device entry"}
+
+        session = DeviceSession(port, self)
+        session.identify()
+        if session.device_id != entry.device_id:
+            session.close()
+            return {"ok": False, "error": "the device on that port has a different id"}
+
+        self._devices[port] = session
+        self._device_ports[entry.device_id] = port
+
+        blob = None
+        if session.link.enter_config_mode():
+            blob = session.link.read_config()
+            session.link.resume_run_mode()
+        session.baseline_pins = (
+            config_model.Entry.from_blob(id_, entry.nickname, blob).pins if blob is not None else None
+        )
+        session.active_pins = entry.pins
+        return {"ok": True, **self._entry_status(entry)}
+
+    def disconnect_entry(self, id_: str):
+        entry = config_model.Entry.load(id_)
+        port = self._device_ports.pop(entry.device_id, None)
+        session = self._devices.pop(port, None) if port else None
         if session:
             session.close()
-        return {"connected": False, "port": port}
+        return True
 
-    def get_status(self, port: str):
-        session = self._devices.get(port)
-        return session.status() if session else {"connected": False, "port": port}
+    # ---- config mode read/write ----------------------------------------
 
-    def assign_device_id(self, port: str, new_id: int):
-        session = self._devices.get(port)
-        if not session:
+    def write_device_config(self, id_: str):
+        entry = config_model.Entry.load(id_)
+        session = self._session_for_device(entry.device_id)
+        if not session or not session.link.connected:
             return False
         if not session.link.enter_config_mode():
             return False
-        ok = session.link.set_device_id(int(new_id) & 0xFF)
-        if ok:
-            session.device_id = int(new_id) & 0xFF
-            session._rebuild_bridge()
+        ok = session.link.write_config(entry.to_blob())
         session.link.resume_run_mode()
+        if ok:
+            session.baseline_pins = entry.pins
+            session.active_pins = entry.pins
         return ok
 
-    # ---- config mode ----------------------------------------------------
-
-    def enter_config(self, port: str):
-        session = self._devices.get(port)
-        return bool(session and session.link.enter_config_mode())
-
-    def resume_run(self, port: str):
-        session = self._devices.get(port)
-        return bool(session and session.link.resume_run_mode())
-
-    def read_device_config(self, port: str):
-        session = self._devices.get(port)
-        if not session:
+    def read_device_config(self, id_: str):
+        entry = config_model.Entry.load(id_)
+        session = self._session_for_device(entry.device_id)
+        if not session or not session.link.connected:
+            return None
+        if not session.link.enter_config_mode():
             return None
         blob = session.link.read_config()
+        session.link.resume_run_mode()
         if blob is None:
             return None
-        preset = config_model.Preset.from_blob("device", blob)
-        session.active_pins = preset.pins
-        session.device_id = preset.device_id
-        return preset.to_dict()
-
-    def write_device_config(self, port: str, preset_dict):
-        session = self._devices.get(port)
-        if not session:
-            return False
-        preset = config_model.Preset.from_dict(preset_dict)
-        preset.device_id = session.device_id  # pin config writes never change device id
-        ok = session.link.write_config(preset.to_blob())
-        if ok:
-            session.active_pins = preset.pins
-        return ok
-
-    # ---- presets ----------------------------------------------------
-
-    def list_presets(self):
-        return config_model.Preset.list_presets()
-
-    def save_preset(self, preset_dict):
-        preset = config_model.Preset.from_dict(preset_dict)
-        return str(preset.save())
-
-    def load_preset(self, name):
-        return config_model.Preset.load(name).to_dict()
-
-    def new_preset(self, name):
-        return config_model.Preset.blank(name).to_dict()
+        fresh = config_model.Entry.from_blob(id_, entry.nickname, blob)
+        session.baseline_pins = fresh.pins
+        session.active_pins = fresh.pins
+        fresh.save()
+        return fresh.to_dict()
 
     # ---- flashing ----------------------------------------------------
 
-    def flash_firmware(self, port: str):
+    def flash_firmware(self, id_: str):
+        entry = config_model.Entry.load(id_)
+        session = self._session_for_device(entry.device_id)
+        if not session:
+            return {"ok": False, "output": "device is not connected"}
         try:
-            output = flasher.flash(port)
+            output = flasher.flash(session.port)
             return {"ok": True, "output": output}
         except flasher.FlashError as exc:
             return {"ok": False, "output": str(exc)}

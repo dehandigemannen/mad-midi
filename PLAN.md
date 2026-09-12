@@ -121,14 +121,31 @@ either way.
   app, keyed by serial port.
 - Each device gets its own **persistent device id**, stored in EEPROM byte 4
   of the header (0 = unassigned). The app reads it via `PING` right after
-  connecting, so identity survives being plugged into a different USB port —
-  presets/port-naming don't depend on which physical port a Mega is on.
+  connecting; if it's still `0` (never adopted before), the app silently
+  assigns the next free id. Identity survives being plugged into a different
+  USB port — config storage doesn't depend on which physical port a Mega is on.
 - Each device gets its **own virtual MIDI port pair**, named from its device
   id once assigned (e.g. `Mad Midi 3 In` / `Mad Midi 3 Out`), or from its
   serial port path if the id hasn't been assigned yet.
-- The MIDI monitor is global across all connected devices (each row tagged
-  with the originating device), since debugging a multi-device rig benefits
-  from seeing all traffic at once.
+- The sidebar lists every **adopted device** and every **draft** (a config not
+  yet tied to hardware) as one flat list of entries, persisted across app
+  restarts and while unplugged. Each entry has its own auto-saved JSON file
+  under `app/devices/`, named by its id (`<device_id>.json` for a device,
+  `draft-<hex>.json` for a draft) — there is no separate named-preset
+  library. Editing an entry's pins auto-saves (debounced) regardless of
+  whether its device is currently connected.
+- A device entry's "Write to device" button recolors when its saved buffer
+  diverges from a baseline snapshot of what's actually on the EEPROM — that
+  baseline is captured by auto-reading the config right when the device is
+  adopted or reconnected, and refreshed after every successful read/write.
+  It's disabled outright while the device is offline.
+- A draft has no connection of its own; instead it offers an "Apply to
+  device" action that copies its pins onto a chosen device entry's buffer
+  (which then goes out of sync until written), so the same draft can seed
+  more than one board.
+- The MIDI monitor follows the sidebar selection by default (only that
+  device's traffic), with an "All devices" pseudo-entry at the top of the
+  sidebar to see every connected device's traffic tagged by origin at once.
 
 ## Repo layout
 
@@ -156,7 +173,7 @@ mad-midi/
       app.js
       style.css
     vendor/avrdude/darwin/     bundled avrdude binary + avrdude.conf
-    presets/                   saved *.json preset files
+    devices/                   one auto-saved *.json per sidebar entry (device or draft)
   requirements.txt
 ```
 
@@ -166,12 +183,14 @@ mad-midi/
   (no push-button, fixed 1:1 relative CC), pots/faders -> CC, shift buttons
   (pure modifier, gates specific encoders' shifted channel/CC — see below).
 - Multiple Megas can be connected simultaneously, each with its own
-  persistent device id, virtual MIDI port pair, and preset read/write; the
-  MIDI monitor shows all devices' traffic tagged by device.
+  persistent device id, virtual MIDI port pair, and auto-saved config; the
+  MIDI monitor can show one device's traffic or all devices' traffic tagged
+  by device.
 - Dual UI: table view and physical board view over one shared config model,
   with live per-pin state overlay while connected in run mode.
 - Unified MIDI monitor: decoded + raw bytes, tagged MIDI vs CTRL.
-- Multiple named, saveable/loadable JSON presets.
+- A sidebar of devices (adopted, persistent, offline-editable) and drafts
+  (configs not yet tied to hardware, applicable to any adopted device).
 - Firmware flashing from the app via bundled avrdude (arm64 + Intel Mac,
   currently one x86_64 binary that runs on both via Rosetta 2).
 - Config-format version byte checked before any EEPROM write is applied.

@@ -7,71 +7,64 @@
 </head>
 <body>
   <div id="app">
-    <header id="topbar">
-      <div class="brand">Mad&nbsp;Midi</div>
+    <aside id="sidebar">
+      <div class="sidebar-header">Mad&nbsp;Midi</div>
+      <div id="entryList"></div>
+      <div id="addDevicePicker" class="add-picker" hidden></div>
+      <div class="sidebar-add">
+        <button id="addDeviceBtn">+ Device</button>
+        <button id="addDraftBtn">+ Draft</button>
+      </div>
+    </aside>
 
-      <div class="group conn-controls">
-        <select id="portSelect"></select>
-        <button id="refreshPortsBtn" title="Refresh ports">&#8635;</button>
-        <button id="connectBtn">Connect</button>
+    <div id="workspace">
+      <header id="topbar">
+        <div id="entryHeader"></div>
+      </header>
+
+      <div id="mainEmpty" hidden>
+        Add a device or draft in the sidebar to start editing a config.
       </div>
 
-      <div class="group preset-controls">
-        <select id="presetSelect"></select>
-        <input id="presetNameInput" placeholder="preset name" size="14" />
-        <button id="newPresetBtn">New</button>
-        <button id="savePresetBtn">Save</button>
+      <div id="main">
+        <div id="centerCol">
+          <div id="viewTabs">
+            <button class="tab active" data-view="table">Table</button>
+            <button class="tab" data-view="board">Board</button>
+          </div>
+
+          <div id="tableView" class="view active">
+            <table id="pinTable">
+              <thead>
+                <tr>
+                  <th>Pin (~ = PWM)</th><th>Role</th><th>Ch</th><th>Note/CC</th>
+                  <th>In min</th><th>In max</th><th>Out min</th><th>Out max</th>
+                  <th>Inv</th><th>Tgl</th><th></th>
+                </tr>
+              </thead>
+              <tbody id="pinTableBody"></tbody>
+            </table>
+          </div>
+
+          <div id="boardView" class="view">
+            <div id="boardGrid"></div>
+          </div>
+        </div>
+
+        <aside id="editorPanel">
+          <h3 id="editorTitle">Select a pin</h3>
+          <div id="editorFields"></div>
+        </aside>
       </div>
 
-      <div class="group device-controls">
-        <button id="readConfigBtn">Read from device</button>
-        <button id="writeConfigBtn">Write to device</button>
-        <button id="flashBtn">Flash firmware</button>
-      </div>
-    </header>
-
-    <div id="deviceBar">
-      <div id="deviceList"></div>
+      <footer id="monitor">
+        <div id="monitorHeader">
+          <span>MIDI Monitor</span>
+          <button id="clearMonitorBtn">Clear</button>
+        </div>
+        <div id="monitorLog"></div>
+      </footer>
     </div>
-
-    <div id="main">
-      <div id="centerCol">
-        <div id="viewTabs">
-          <button class="tab active" data-view="table">Table</button>
-          <button class="tab" data-view="board">Board</button>
-        </div>
-
-        <div id="tableView" class="view active">
-          <table id="pinTable">
-            <thead>
-              <tr>
-                <th>Pin (~ = PWM)</th><th>Role</th><th>Ch</th><th>Note/CC</th>
-                <th>In min</th><th>In max</th><th>Out min</th><th>Out max</th>
-                <th>Inv</th><th>Tgl</th><th></th>
-              </tr>
-            </thead>
-            <tbody id="pinTableBody"></tbody>
-          </table>
-        </div>
-
-        <div id="boardView" class="view">
-          <div id="boardGrid"></div>
-        </div>
-      </div>
-
-      <aside id="editorPanel">
-        <h3 id="editorTitle">Select a pin</h3>
-        <div id="editorFields"></div>
-      </aside>
-    </div>
-
-    <footer id="monitor">
-      <div id="monitorHeader">
-        <span>MIDI Monitor</span>
-        <button id="clearMonitorBtn">Clear</button>
-      </div>
-      <div id="monitorLog"></div>
-    </footer>
   </div>
 
   <script src="app.js"></script>
