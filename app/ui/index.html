@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mad Midi</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">Mad&nbsp;Midi</div>
+
+      <div class="group conn-controls">
+        <select id="portSelect"></select>
+        <button id="refreshPortsBtn" title="Refresh ports">&#8635;</button>
+        <button id="connectBtn">Connect</button>
+      </div>
+
+      <div class="group preset-controls">
+        <select id="presetSelect"></select>
+        <input id="presetNameInput" placeholder="preset name" size="14" />
+        <button id="newPresetBtn">New</button>
+        <button id="savePresetBtn">Save</button>
+      </div>
+
+      <div class="group device-controls">
+        <button id="readConfigBtn">Read from device</button>
+        <button id="writeConfigBtn">Write to device</button>
+        <button id="flashBtn">Flash firmware</button>
+      </div>
+    </header>
+
+    <div id="deviceBar">
+      <div id="deviceList"></div>
+    </div>
+
+    <div id="main">
+      <div id="centerCol">
+        <div id="viewTabs">
+          <button class="tab active" data-view="table">Table</button>
+          <button class="tab" data-view="board">Board</button>
+        </div>
+
+        <div id="tableView" class="view active">
+          <table id="pinTable">
+            <thead>
+              <tr>
+                <th>Pin</th><th>Role</th><th>Ch</th><th>Note/CC</th>
+                <th>In min</th><th>In max</th><th>Out min</th><th>Out max</th>
+                <th>Inv</th><th>Tgl</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="pinTableBody"></tbody>
+          </table>
+        </div>
+
+        <div id="boardView" class="view">
+          <div id="boardGrid"></div>
+        </div>
+      </div>
+
+      <aside id="editorPanel">
+        <h3 id="editorTitle">Select a pin</h3>
+        <div id="editorFields"></div>
+      </aside>
+    </div>
+
+    <footer id="monitor">
+      <div id="monitorHeader">
+        <span>MIDI Monitor</span>
+        <button id="clearMonitorBtn">Clear</button>
+      </div>
+      <div id="monitorLog"></div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
