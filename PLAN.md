@@ -61,7 +61,7 @@ Reply convention: success = request CMD `| 0x80`, error = request CMD `| 0xC0`.
 ```
 Header (6 bytes):
   [0-1] magic = 'M','M'
-  [2]   config format version (currently 2)
+  [2]   config format version (currently 3)
   [3]   pin count (70)
   [4]   device id (0 = unassigned; set once via SET_DEVICE_ID, persists across reconnects/ports)
   [5]   checksum (sum of all record bytes, mod 256 — does NOT cover the device id byte,
@@ -79,7 +79,8 @@ Records: 70 x 8 bytes, indexed by Arduino Mega pin number directly
     [4] inMax
     [5] outMin
     [6] outMax
-    [7] flags   (bit0 invert, bit1 toggle-mode; rest reserved)
+    [7] flags   (bit0 invert, bit1 toggle-mode, bit2 match-CC-not-Note
+                 [LIGHT_DIGITAL/LIGHT_PWM only, see below]; rest reserved)
 ```
 
 ### PinRole enum (v1)
@@ -89,8 +90,8 @@ Records: 70 x 8 bytes, indexed by Arduino Mega pin number directly
 | 0 | UNUSED | — | pin ignored |
 | 1 | BUTTON_NOTE | digital-in -> MIDI out | press = Note On, release = Note Off |
 | 2 | BUTTON_CC | digital-in -> MIDI out | momentary or toggle CC (flags bit1) |
-| 3 | LIGHT_DIGITAL | MIDI in -> digital out | on/off from incoming note/CC |
-| 4 | LIGHT_PWM | MIDI in -> PWM out | `analogWrite(map(value, inMin,inMax, outMin,outMax))` — also used for VU meters (single-pin analog needle) |
+| 3 | LIGHT_DIGITAL | MIDI in -> digital out | on/off from an incoming Note or CC (which one is chosen by flags bit2, `FLAG_MATCH_CC`) |
+| 4 | LIGHT_PWM | MIDI in -> PWM out | `analogWrite(map(value, inMin,inMax, outMin,outMax))` — also used for VU meters (single-pin analog needle); Note vs CC selected the same way as LIGHT_DIGITAL |
 | 5 | ENCODER_A | digital-in pair -> MIDI out | quadrature phase A; paired with the next pin (ENCODER_B). Fixed 1:1, relative CC: value `1` = +1 step (CW), value `127` = -1 step (CCW). Fields are repurposed for shift support (see below) |
 | 6 | ENCODER_B | — | marks the pin as consumed by the preceding ENCODER_A |
 | 7 | POT_CC | analog-in -> MIDI out | raw ADC (0-1023, stored as inMin/inMax >>2) scaled to CC 0-127 |

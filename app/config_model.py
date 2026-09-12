@@ -23,13 +23,18 @@ class PinConfig:
     out_max: int = 0
     invert: bool = False
     toggle: bool = False
+    match_cc: bool = False  # light_digital/light_pwm only: match a CC instead of a Note
 
     @property
     def reserved(self) -> bool:
         return self.pin in protocol.RESERVED_PINS
 
     def to_tuple(self):
-        flags = (protocol.FLAG_INVERT if self.invert else 0) | (protocol.FLAG_TOGGLE if self.toggle else 0)
+        flags = (
+            (protocol.FLAG_INVERT if self.invert else 0)
+            | (protocol.FLAG_TOGGLE if self.toggle else 0)
+            | (protocol.FLAG_MATCH_CC if self.match_cc else 0)
+        )
         role_val = protocol.ROLE_BY_NAME.get(self.role, protocol.ROLE_UNUSED)
         return (
             role_val, self.channel & 0x0F, self.number & 0x7F,
@@ -51,6 +56,7 @@ class PinConfig:
             out_max=out_max,
             invert=bool(flags & protocol.FLAG_INVERT),
             toggle=bool(flags & protocol.FLAG_TOGGLE),
+            match_cc=bool(flags & protocol.FLAG_MATCH_CC),
         )
 
     def to_dict(self):

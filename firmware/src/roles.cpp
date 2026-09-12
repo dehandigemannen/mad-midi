@@ -193,6 +193,7 @@ void rolesHandleIncomingNote(uint8_t channel, uint8_t note, uint8_t velocity, bo
     if (isPinReserved(pin)) continue;
     const PinConfig& c = pinConfigs[pin];
     if (c.role != ROLE_LIGHT_DIGITAL && c.role != ROLE_LIGHT_PWM) continue;
+    if (c.flags & FLAG_MATCH_CC) continue; // this pin is set to match CC, not Note
     if (c.channel != channel || c.number != note) continue;
     applyToOutputPin(pin, isOn ? velocity : 0, c.inMin, c.inMax);
   }
@@ -203,6 +204,7 @@ void rolesHandleIncomingCC(uint8_t channel, uint8_t controller, uint8_t value) {
     if (isPinReserved(pin)) continue;
     const PinConfig& c = pinConfigs[pin];
     if (c.role != ROLE_LIGHT_DIGITAL && c.role != ROLE_LIGHT_PWM) continue;
+    if (!(c.flags & FLAG_MATCH_CC)) continue; // this pin is set to match Note, not CC
     if (c.channel != channel || c.number != controller) continue;
     applyToOutputPin(pin, value, c.inMin, c.inMax);
   }

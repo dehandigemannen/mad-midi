@@ -2,7 +2,7 @@
 #include <Arduino.h>
 
 static const uint8_t PIN_COUNT = 70; // Mega: 0-53 digital, 54-69 = A0-A15
-static const uint8_t CONFIG_FORMAT_VERSION = 2; // bumped: header gained deviceId, encoder fields reinterpreted for shift
+static const uint8_t CONFIG_FORMAT_VERSION = 3; // bumped: header gained deviceId, encoder fields reinterpreted for shift, FLAG_MATCH_CC added
 
 enum PinRole : uint8_t {
   ROLE_UNUSED = 0,
@@ -19,6 +19,10 @@ enum PinRole : uint8_t {
 enum PinFlags : uint8_t {
   FLAG_INVERT = 1 << 0,
   FLAG_TOGGLE = 1 << 1,
+  // LIGHT_DIGITAL/LIGHT_PWM only: unset = number is a Note, set = number is a CC.
+  // Without this a light would ambiguously match either a Note or a CC with
+  // the same number.
+  FLAG_MATCH_CC = 1 << 2,
 };
 
 // For ROLE_ENCODER_A, inMin/inMax/outMin/outMax are repurposed (encoders

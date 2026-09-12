@@ -32,18 +32,39 @@ const ROLE_FIELDS = {
   button_note: ["channel", "number", "invert"],
   button_cc: ["channel", "number", "invert", "toggle"],
   light_digital: ["channel", "number", "in_min", "in_max", "invert"],
-  light_pwm: ["channel", "number", "in_min", "in_max", "out_min", "out_max", "invert"],
+  light_pwm: [
+    "channel",
+    "number",
+    "in_min",
+    "in_max",
+    "out_min",
+    "out_max",
+    "invert",
+  ],
   encoder_a: ["channel", "number"], // shift fields are rendered separately, see renderEditor
   encoder_b: [],
-  pot_cc: ["channel", "number", "in_min", "in_max", "out_min", "out_max", "invert"],
+  pot_cc: [
+    "channel",
+    "number",
+    "in_min",
+    "in_max",
+    "out_min",
+    "out_max",
+    "invert",
+  ],
   button_shift: ["invert"],
 };
 
 const NO_SHIFT_PIN = 255;
 
 const FIELD_META = {
-  channel: { label: "MIDI Channel", type: "number", min: 1, max: 16, offset: -1 },
-  number: { label: "Note/CC #", type: "number", min: 0, max: 127 },
+  channel: {
+    label: "MIDI Channel",
+    type: "number",
+    min: 1,
+    max: 16,
+    offset: -1,
+  },
   in_min: { label: "In min", type: "number", min: 0, max: 255 },
   in_max: { label: "In max", type: "number", min: 0, max: 255 },
   out_min: { label: "Out min", type: "number", min: 0, max: 255 },
@@ -52,12 +73,53 @@ const FIELD_META = {
   toggle: { label: "Toggle (vs momentary)", type: "checkbox" },
 };
 
-function isAnalogPin(pin) { return pin >= 54 && pin < PIN_COUNT; }
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+function noteNumberToName(n) {
+  const octave = Math.floor(n / 12) - 1; // MIDI note 60 = C4 (middle C)
+  return `${NOTE_NAMES[n % 12]}${octave}`;
+}
+
+function buildNoteSelect(value, onChange) {
+  const select = document.createElement("select");
+  for (let n = 0; n <= 127; n++) {
+    const opt = document.createElement("option");
+    opt.value = String(n);
+    opt.textContent = `${noteNumberToName(n)} (${n})`;
+    if (n === value) opt.selected = true;
+    select.appendChild(opt);
+  }
+  select.addEventListener("change", () => onChange(parseInt(select.value, 10)));
+  return select;
+}
+
+// Whether a pin's "number" field should currently be shown/entered as a
+// note name rather than a plain CC number.
+function usesNoteName(p) {
+  if (p.role === "button_note") return true;
+  if (p.role === "light_digital" || p.role === "light_pwm") return !p.match_cc;
+  return false;
+}
+
+function displayNumber(p) {
+  if (p.role === "unused" || p.role === "encoder_b") return "";
+  return usesNoteName(p) ? `${noteNumberToName(p.number)} (${p.number})` : String(p.number);
+}
+
+function isAnalogPin(pin) {
+  return pin >= 54 && pin < PIN_COUNT;
+}
 
 function allowedRoles(pin) {
   if (RESERVED_PINS.has(pin)) return [];
   if (isAnalogPin(pin)) return ["unused", "pot_cc"];
-  const roles = ["unused", "button_note", "button_cc", "button_shift", "light_digital"];
+  const roles = [
+    "unused",
+    "button_note",
+    "button_cc",
+    "button_shift",
+    "light_digital",
+  ];
   if (PWM_PINS.has(pin)) roles.push("light_pwm");
   if (pin < 53) roles.push("encoder_a");
   return roles;
@@ -70,11 +132,11 @@ function pinLabel(pin) {
 // ---- app state -----------------------------------------------------------
 
 const state = {
-  pins: [],           // array of PIN_COUNT pin config objects — one shared editing buffer
+  pins: [], // array of PIN_COUNT pin config objects — one shared editing buffer
   presetName: "untitled",
   selectedPin: null,
-  devices: {},        // port -> status dict from list_devices()
-  targetPort: null,   // which connected device Read/Write/Flash/Assign-ID act on
+  devices: {}, // port -> status dict from list_devices()
+  targetPort: null, // which connected device Read/Write/Flash/Assign-ID act on
   view: "table",
   monitorRows: 0,
 };
@@ -83,15 +145,25 @@ function blankPins() {
   const pins = [];
   for (let i = 0; i < PIN_COUNT; i++) {
     pins.push({
-      pin: i, role: "unused", channel: 0, number: 0,
-      in_min: 0, in_max: 0, out_min: 0, out_max: 0,
-      invert: false, toggle: false,
+      pin: i,
+      role: "unused",
+      channel: 0,
+      number: 0,
+      in_min: 0,
+      in_max: 0,
+      out_min: 0,
+      out_max: 0,
+      invert: false,
+      toggle: false,
+      match_cc: false,
     });
   }
   return pins;
 }
 
-function pinByIndex(i) { return state.pins[i]; }
+function pinByIndex(i) {
+  return state.pins[i];
+}
 
 // ---- role assignment (handles encoder pairing) ---------------------------
 
@@ -122,7 +194,11 @@ function setPinRole(pin, role) {
 function setPinField(pin, field, value) {
   const p = pinByIndex(pin);
   p[field] = value;
-  if (p.role === "encoder_a" && pin + 1 < PIN_COUNT && (field === "channel" || field === "number")) {
+  if (
+    p.role === "encoder_a" &&
+    pin + 1 < PIN_COUNT &&
+    (field === "channel" || field === "number")
+  ) {
     pinByIndex(pin + 1)[field] = value;
   }
 }
@@ -157,36 +233,75 @@ function buildTableRow(pin) {
   if (p.role === "encoder_b") tr.classList.add("encoder-b");
   if (state.selectedPin === pin) tr.classList.add("selected");
 
-  const cell = (text) => { const td = document.createElement("td"); td.textContent = text; return td; };
-
-  tr.appendChild((() => {
-    const td = cell("");
-    const span = document.createElement("span");
-    span.className = "pin-badge";
-    span.textContent = pinLabel(pin);
-    td.appendChild(span);
-    if (!RESERVED_PINS.has(pin)) {
-      const dot = document.createElement("span");
-      dot.className = "activity-dot";
-      dot.id = `dot-${pin}`;
-      td.appendChild(dot);
-    }
+  const cell = (text) => {
+    const td = document.createElement("td");
+    td.textContent = text;
     return td;
-  })());
+  };
+
+  tr.appendChild(
+    (() => {
+      const td = cell("");
+      const span = document.createElement("span");
+      span.className = "pin-badge";
+      span.textContent = pinLabel(pin);
+      td.appendChild(span);
+      if (PWM_PINS.has(pin)) {
+        const pwm = document.createElement("span");
+        pwm.className = "pwm-mark";
+        pwm.textContent = "~";
+        pwm.title = "PWM-capable pin";
+        td.appendChild(pwm);
+      }
+      if (!RESERVED_PINS.has(pin)) {
+        const dot = document.createElement("span");
+        dot.className = "activity-dot";
+        dot.id = `dot-${pin}`;
+        td.appendChild(dot);
+      }
+      return td;
+    })(),
+  );
 
   if (RESERVED_PINS.has(pin)) {
-    tr.appendChild(cell(pin === 13 ? "reserved (status LED)" : "reserved (USB serial)"));
+    tr.appendChild(
+      cell(pin === 13 ? "reserved (status LED)" : "reserved (USB serial)"),
+    );
     for (let i = 0; i < 9; i++) tr.appendChild(cell(""));
   } else {
-    tr.appendChild(cell(p.role === "encoder_b" ? `↳ ${ROLE_LABELS.encoder_b} (pin ${pin - 1})` : ROLE_LABELS[p.role]));
-    tr.appendChild(cell(p.role === "unused" || p.role === "encoder_b" ? "" : String(p.channel + 1)));
-    tr.appendChild(cell(p.role === "unused" || p.role === "encoder_b" ? "" : String(p.number)));
-    tr.appendChild(cell(ROLE_FIELDS[p.role].includes("in_min") ? String(p.in_min) : ""));
-    tr.appendChild(cell(ROLE_FIELDS[p.role].includes("in_max") ? String(p.in_max) : ""));
-    tr.appendChild(cell(ROLE_FIELDS[p.role].includes("out_min") ? String(p.out_min) : ""));
-    tr.appendChild(cell(ROLE_FIELDS[p.role].includes("out_max") ? String(p.out_max) : ""));
-    tr.appendChild(cell(ROLE_FIELDS[p.role].includes("invert") && p.invert ? "✓" : ""));
-    tr.appendChild(cell(ROLE_FIELDS[p.role].includes("toggle") && p.toggle ? "✓" : ""));
+    tr.appendChild(
+      cell(
+        p.role === "encoder_b"
+          ? `↳ ${ROLE_LABELS.encoder_b} (pin ${pin - 1})`
+          : ROLE_LABELS[p.role],
+      ),
+    );
+    tr.appendChild(
+      cell(
+        p.role === "unused" || p.role === "encoder_b"
+          ? ""
+          : String(p.channel + 1),
+      ),
+    );
+    tr.appendChild(cell(displayNumber(p)));
+    tr.appendChild(
+      cell(ROLE_FIELDS[p.role].includes("in_min") ? String(p.in_min) : ""),
+    );
+    tr.appendChild(
+      cell(ROLE_FIELDS[p.role].includes("in_max") ? String(p.in_max) : ""),
+    );
+    tr.appendChild(
+      cell(ROLE_FIELDS[p.role].includes("out_min") ? String(p.out_min) : ""),
+    );
+    tr.appendChild(
+      cell(ROLE_FIELDS[p.role].includes("out_max") ? String(p.out_max) : ""),
+    );
+    tr.appendChild(
+      cell(ROLE_FIELDS[p.role].includes("invert") && p.invert ? "✓" : ""),
+    );
+    tr.appendChild(
+      cell(ROLE_FIELDS[p.role].includes("toggle") && p.toggle ? "✓" : ""),
+    );
   }
   tr.appendChild(cell(""));
 
@@ -201,6 +316,11 @@ function buildTableRow(pin) {
 function renderBoard() {
   const grid = document.getElementById("boardGrid");
   grid.innerHTML = "";
+
+  const legend = document.createElement("div");
+  legend.className = "board-legend";
+  legend.innerHTML = '<span class="pwm-mark">~</span> = PWM-capable pin';
+  grid.appendChild(legend);
 
   const addRow = (label, pins) => {
     const wrap = document.createElement("div");
@@ -238,14 +358,22 @@ function buildPinBox(pin) {
 
   const pn = document.createElement("div");
   pn.className = "pn";
-  pn.textContent = pinLabel(pin);
+  pn.textContent = pinLabel(pin) + (PWM_PINS.has(pin) ? " ~" : "");
   box.appendChild(pn);
+  if (PWM_PINS.has(pin)) {
+    box.classList.add("pwm");
+    box.title = "PWM-capable pin";
+  }
 
   const role = document.createElement("div");
   role.className = "role";
   role.textContent = RESERVED_PINS.has(pin)
-    ? (pin === 13 ? "LED" : "USB")
-    : (p.role === "unused" ? "–" : ROLE_LABELS[p.role].replace(" → ", "→"));
+    ? pin === 13
+      ? "LED"
+      : "USB"
+    : p.role === "unused"
+      ? "–"
+      : ROLE_LABELS[p.role].replace(" → ", "→");
   box.appendChild(role);
 
   if (!RESERVED_PINS.has(pin) && p.role !== "encoder_b") {
@@ -286,7 +414,9 @@ function renderEditor() {
     if (r === p.role) opt.selected = true;
     roleSelect.appendChild(opt);
   });
-  roleSelect.addEventListener("change", () => setPinRole(pin, roleSelect.value));
+  roleSelect.addEventListener("change", () =>
+    setPinRole(pin, roleSelect.value),
+  );
   roleRow.appendChild(roleLabel);
   roleRow.appendChild(roleSelect);
   fields.appendChild(roleRow);
@@ -294,7 +424,8 @@ function renderEditor() {
   if (isAnalogPin(pin) && p.role === "pot_cc") {
     const hint = document.createElement("div");
     hint.className = "field-hint";
-    hint.textContent = "In min/max are raw ADC ÷ 4 (0–255 covers the 0–1023 range).";
+    hint.textContent =
+      "In min/max are raw ADC ÷ 4 (0–255 covers the 0–1023 range).";
     fields.appendChild(hint);
   }
   if (p.role === "encoder_a") {
@@ -306,29 +437,33 @@ function renderEditor() {
   if (p.role === "button_shift") {
     const hint = document.createElement("div");
     hint.className = "field-hint";
-    hint.textContent = "Pure modifier — sends no MIDI itself. Assign it as an encoder's shift button below.";
+    hint.textContent =
+      "Pure modifier — sends no MIDI itself. Assign it as an encoder's shift button below.";
     fields.appendChild(hint);
   }
-  if (p.role === "light_digital" || p.role === "light_pwm") {
-    const hint = document.createElement("div");
-    hint.className = "field-hint";
-    hint.textContent = "Responds to a matching incoming Note or CC (same channel + number).";
-    fields.appendChild(hint);
-  }
-
   ROLE_FIELDS[p.role].forEach((field) => {
+    if (field === "number") {
+      renderNumberField(pin, p, fields);
+      return;
+    }
     const meta = FIELD_META[field];
     const row = document.createElement("div");
     row.className = "field-row" + (meta.type === "checkbox" ? " checkbox" : "");
 
     if (meta.type === "checkbox") {
+      const label = document.createElement("label");
+      label.className = "checkbox-label";
       const input = document.createElement("input");
       input.type = "checkbox";
       input.checked = !!p[field];
-      input.addEventListener("change", () => { setPinField(pin, field, input.checked); renderAll(); });
-      const label = document.createElement("label");
-      label.textContent = meta.label;
-      row.appendChild(input);
+      input.addEventListener("change", () => {
+        setPinField(pin, field, input.checked);
+        renderAll();
+      });
+      const text = document.createElement("span");
+      text.textContent = meta.label;
+      label.appendChild(input);
+      label.appendChild(text);
       row.appendChild(label);
     } else {
       const label = document.createElement("label");
@@ -352,6 +487,60 @@ function renderEditor() {
   });
 
   if (p.role === "encoder_a") renderEncoderShiftFields(pin, p, fields);
+}
+
+function renderNumberField(pin, p, fields) {
+  const isDualRole = p.role === "light_digital" || p.role === "light_pwm";
+
+  if (isDualRole) {
+    const typeRow = document.createElement("div");
+    typeRow.className = "field-row";
+    const typeLabel = document.createElement("label");
+    typeLabel.textContent = "Triggered by";
+    const typeSelect = document.createElement("select");
+    [["note", "Note"], ["cc", "CC"]].forEach(([value, text]) => {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      if ((value === "cc") === !!p.match_cc) opt.selected = true;
+      typeSelect.appendChild(opt);
+    });
+    typeSelect.addEventListener("change", () => {
+      setPinField(pin, "match_cc", typeSelect.value === "cc");
+      renderAll();
+    });
+    typeRow.appendChild(typeLabel);
+    typeRow.appendChild(typeSelect);
+    fields.appendChild(typeRow);
+
+    const hint = document.createElement("div");
+    hint.className = "field-hint";
+    hint.textContent = `Responds to an incoming ${p.match_cc ? "CC" : "Note"} with this channel + number.`;
+    fields.appendChild(hint);
+  }
+
+  const row = document.createElement("div");
+  row.className = "field-row";
+  const label = document.createElement("label");
+  const useNoteName = usesNoteName(p);
+  label.textContent = useNoteName ? "Note" : "CC #";
+  row.appendChild(label);
+
+  if (useNoteName) {
+    row.appendChild(buildNoteSelect(p.number, (v) => setPinField(pin, "number", v)));
+  } else {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = 0;
+    input.max = 127;
+    input.value = p.number;
+    input.addEventListener("change", () => {
+      const v = Math.max(0, Math.min(127, parseInt(input.value, 10) || 0));
+      setPinField(pin, "number", v);
+    });
+    row.appendChild(input);
+  }
+  fields.appendChild(row);
 }
 
 function renderEncoderShiftFields(pin, p, fields) {
@@ -378,7 +567,9 @@ function renderEncoderShiftFields(pin, p, fields) {
   });
 
   const validIds = new Set([NO_SHIFT_PIN, ...shiftButtons.map((s) => s.idx)]);
-  select.value = validIds.has(p.in_min) ? String(p.in_min) : String(NO_SHIFT_PIN);
+  select.value = validIds.has(p.in_min)
+    ? String(p.in_min)
+    : String(NO_SHIFT_PIN);
 
   select.addEventListener("change", () => {
     setPinField(pin, "in_min", parseInt(select.value, 10));
@@ -391,7 +582,8 @@ function renderEncoderShiftFields(pin, p, fields) {
   if (shiftButtons.length === 0) {
     const hint = document.createElement("div");
     hint.className = "field-hint";
-    hint.textContent = "No shift buttons configured yet — set another pin's role to \"Shift button\" first.";
+    hint.textContent =
+      'No shift buttons configured yet — set another pin\'s role to "Shift button" first.';
     fields.appendChild(hint);
   }
 
@@ -471,7 +663,9 @@ function appendMonitorRow(evt) {
 
   const raw = document.createElement("span");
   raw.className = "raw";
-  raw.textContent = evt.raw.map((b) => b.toString(16).padStart(2, "0")).join(" ");
+  raw.textContent = evt.raw
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join(" ");
 
   row.appendChild(t);
   row.appendChild(dir);
@@ -538,7 +732,9 @@ function deviceLabel(status) {
 async function refreshDevices() {
   const list = await api("list_devices");
   state.devices = {};
-  list.forEach((d) => { state.devices[d.port] = d; });
+  list.forEach((d) => {
+    state.devices[d.port] = d;
+  });
 
   if (!state.targetPort || !state.devices[state.targetPort]) {
     const ports = Object.keys(state.devices);
@@ -555,7 +751,8 @@ function renderDeviceBar() {
   if (ports.length === 0) {
     const empty = document.createElement("div");
     empty.className = "device-empty";
-    empty.textContent = "No devices connected — pick a port above and click Connect.";
+    empty.textContent =
+      "No devices connected — pick a port above and click Connect.";
     list.appendChild(empty);
     return;
   }
@@ -563,7 +760,8 @@ function renderDeviceBar() {
   ports.forEach((port) => {
     const d = state.devices[port];
     const chip = document.createElement("div");
-    chip.className = "device-chip" + (port === state.targetPort ? " target" : "");
+    chip.className =
+      "device-chip" + (port === state.targetPort ? " target" : "");
 
     const name = document.createElement("span");
     name.className = "dc-name";
@@ -587,11 +785,15 @@ function renderDeviceBar() {
     });
 
     if (!d.device_id) {
+      const idLabel = document.createElement("label");
+      idLabel.className = "inline-label";
+      idLabel.textContent = "New ID:";
       const idInput = document.createElement("input");
       idInput.type = "number";
       idInput.min = 1;
       idInput.max = 255;
-      idInput.placeholder = "id";
+      idInput.title = "Device ID to assign (1-255)";
+      idLabel.appendChild(idInput);
       const assignBtn = document.createElement("button");
       assignBtn.textContent = "Assign ID";
       assignBtn.addEventListener("click", async () => {
@@ -601,7 +803,7 @@ function renderDeviceBar() {
         if (!ok) alert("Failed to assign device id.");
         await refreshDevices();
       });
-      chip.appendChild(idInput);
+      chip.appendChild(idLabel);
       chip.appendChild(assignBtn);
     }
 
@@ -639,7 +841,9 @@ function loadPinsFromDict(dict) {
 
 function requireTarget() {
   if (!state.targetPort) {
-    alert("No target device selected — connect a Mega and select it in the device list first.");
+    alert(
+      "No target device selected — connect a Mega and select it in the device list first.",
+    );
     return null;
   }
   return state.targetPort;
@@ -649,7 +853,10 @@ async function readFromDevice() {
   const port = requireTarget();
   if (!port) return;
   const ok = await api("enter_config", port);
-  if (!ok) { alert("Could not enter config mode — is the device connected?"); return; }
+  if (!ok) {
+    alert("Could not enter config mode — is the device connected?");
+    return;
+  }
   const dict = await api("read_device_config", port);
   await api("resume_run", port);
   await refreshDevices();
@@ -661,17 +868,27 @@ async function writeToDevice() {
   const port = requireTarget();
   if (!port) return;
   const ok = await api("enter_config", port);
-  if (!ok) { alert("Could not enter config mode — is the device connected?"); return; }
+  if (!ok) {
+    alert("Could not enter config mode — is the device connected?");
+    return;
+  }
   const success = await api("write_device_config", port, pinsToDict());
   await api("resume_run", port);
   await refreshDevices();
-  alert(success ? "Config written to device." : "Write failed (version/checksum mismatch?).");
+  alert(
+    success
+      ? "Config written to device."
+      : "Write failed (version/checksum mismatch?).",
+  );
 }
 
 async function flashFirmware() {
   const port = requireTarget();
   if (!port) return;
-  if (!confirm(`Flash firmware to the Mega on ${port}? This takes a few seconds.`)) return;
+  if (
+    !confirm(`Flash firmware to the Mega on ${port}? This takes a few seconds.`)
+  )
+    return;
   const result = await api("flash_firmware", port);
   alert(result.ok ? "Flash succeeded." : "Flash failed:\n\n" + result.output);
 }
@@ -679,10 +896,18 @@ async function flashFirmware() {
 // ---- wiring -----------------------------------------------------------------
 
 function initEventListeners() {
-  document.getElementById("refreshPortsBtn").addEventListener("click", refreshPorts);
-  document.getElementById("connectBtn").addEventListener("click", connectDevice);
-  document.getElementById("readConfigBtn").addEventListener("click", readFromDevice);
-  document.getElementById("writeConfigBtn").addEventListener("click", writeToDevice);
+  document
+    .getElementById("refreshPortsBtn")
+    .addEventListener("click", refreshPorts);
+  document
+    .getElementById("connectBtn")
+    .addEventListener("click", connectDevice);
+  document
+    .getElementById("readConfigBtn")
+    .addEventListener("click", readFromDevice);
+  document
+    .getElementById("writeConfigBtn")
+    .addEventListener("click", writeToDevice);
   document.getElementById("flashBtn").addEventListener("click", flashFirmware);
   document.getElementById("clearMonitorBtn").addEventListener("click", () => {
     document.getElementById("monitorLog").innerHTML = "";
@@ -690,29 +915,41 @@ function initEventListeners() {
   });
 
   document.getElementById("newPresetBtn").addEventListener("click", () => {
-    const name = document.getElementById("presetNameInput").value.trim() || "untitled";
+    const name =
+      document.getElementById("presetNameInput").value.trim() || "untitled";
     loadPinsFromDict({ name, pins: blankPins() });
   });
 
-  document.getElementById("savePresetBtn").addEventListener("click", async () => {
-    state.presetName = document.getElementById("presetNameInput").value.trim() || "untitled";
-    await api("save_preset", pinsToDict());
-    await refreshPresets();
-  });
+  document
+    .getElementById("savePresetBtn")
+    .addEventListener("click", async () => {
+      state.presetName =
+        document.getElementById("presetNameInput").value.trim() || "untitled";
+      await api("save_preset", pinsToDict());
+      await refreshPresets();
+    });
 
-  document.getElementById("presetSelect").addEventListener("change", async (e) => {
-    if (!e.target.value) return;
-    const dict = await api("load_preset", e.target.value);
-    loadPinsFromDict(dict);
-    await refreshPresets();
-  });
+  document
+    .getElementById("presetSelect")
+    .addEventListener("change", async (e) => {
+      if (!e.target.value) return;
+      const dict = await api("load_preset", e.target.value);
+      loadPinsFromDict(dict);
+      await refreshPresets();
+    });
 
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       state.view = tab.dataset.view;
-      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-      document.getElementById("tableView").classList.toggle("active", state.view === "table");
-      document.getElementById("boardView").classList.toggle("active", state.view === "board");
+      document
+        .querySelectorAll(".tab")
+        .forEach((t) => t.classList.toggle("active", t === tab));
+      document
+        .getElementById("tableView")
+        .classList.toggle("active", state.view === "table");
+      document
+        .getElementById("boardView")
+        .classList.toggle("active", state.view === "board");
     });
   });
 

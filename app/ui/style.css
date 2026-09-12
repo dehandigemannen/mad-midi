@@ -142,6 +142,13 @@ button:disabled {
   padding: 2px 4px;
 }
 
+.inline-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
 .device-chip button {
   padding: 2px 6px;
   font-size: 10px;
@@ -249,6 +256,13 @@ button:disabled {
   font-family: var(--mono);
 }
 
+.pwm-mark {
+  color: var(--warn);
+  font-family: var(--mono);
+  font-weight: 700;
+  margin-left: 2px;
+}
+
 .activity-dot {
   display: inline-block;
   width: 7px;
@@ -271,6 +285,11 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 18px;
+}
+
+.board-legend {
+  font-size: 11px;
+  color: var(--text-dim);
 }
 
 .board-row {
@@ -304,6 +323,8 @@ button:disabled {
 }
 
 .pin-box:hover { border-color: var(--accent); }
+.pin-box.pwm { border-color: #6b5a2a; box-shadow: inset 0 -2px 0 var(--warn); }
+.pin-box.pwm:hover { border-color: var(--accent); }
 .pin-box.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .pin-box.reserved { opacity: 0.35; cursor: default; }
 .pin-box.encoder-b { opacity: 0.7; }
@@ -342,8 +363,15 @@ button:disabled {
 
 .field-row.checkbox {
   flex-direction: row;
+}
+
+.checkbox-label {
+  display: flex;
   align-items: center;
   gap: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-dim);
 }
 
 .field-row select, .field-row input {
