@@ -58,6 +58,26 @@ const ROLE_FIELDS = {
 
 const NO_SHIFT_PIN = 255;
 
+// ---- sequencer: default CC-number offsets per step function ---------------
+// Distinct, non-overlapping ranges (8 slots each) so up to 8 steps' internal
+// signals never collide with each other. Just defaults — since these are
+// ordinary PinConfig fields, they can still be hand-edited in Table/Board.
+const SEQ_BASE = {
+  button: 0,
+  encoder: 8,
+  encoder_shifted: 16,
+  active_light: 24,
+  step_light: 32,
+};
+const SEQ_MAX_STEPS = 8;
+const SEQ_FN_LABELS = {
+  button: "Button",
+  encoder: "Encoder",
+  shift: "Shift",
+  active_light: "Active light",
+  step_light: "Step light",
+};
+
 const FIELD_META = {
   channel: {
     label: "MIDI Channel",
@@ -142,9 +162,12 @@ const state = {
   addDevicePorts: null, // non-null while the "+ Device" port picker is open
   reconnectingId: null, // entry id whose inline "connect to port" picker is open
   reconnectPorts: [],
+  sequencer: null, // {channel, subdivision, steps: [...]} for the selected entry
+  sequencerLive: null, // {device_id, running, current_step, step_enabled} pushed from a connected device, or null
 };
 
 let saveTimer = null;
+let sequencerSaveTimer = null;
 
 function pinByIndex(i) {
   return state.pins[i];
@@ -215,6 +238,178 @@ function applyEntryStatus(status) {
   if ("in_sync" in status) entry.in_sync = status.in_sync;
   renderSidebar();
   renderHeader();
+}
+
+// ---- sequencer: pin assignment (mirrors setPinRole's cleanup-then-assign) --
+
+function blankSequencerStep() {
+  return {
+    note: 60,
+    button_pin: null,
+    encoder_pin: null,
+    shift_pin: null,
+    active_light_pin: null,
+    step_light_pin: null,
+  };
+}
+
+// Pins currently eligible for a given step's function: unused, or already
+// holding that exact slot. Encoder additionally needs a free pin+1 (its
+// encoder_b partner), same constraint setPinRole already applies elsewhere.
+// This is what makes "not enough free pins" a natural block: once nothing
+// is unused, the dropdown simply has nothing else to offer.
+function sequencerEligiblePins(stepIndex, fn) {
+  const step = state.sequencer.steps[stepIndex];
+  const currentlyAssigned = step[fn + "_pin"];
+  const maxPin = fn === "encoder" ? 53 : 54; // encoder_a needs pin < 53, like allowedRoles()
+  const result = [];
+  for (let pin = 0; pin < maxPin; pin++) {
+    if (RESERVED_PINS.has(pin)) continue;
+    if (pin === currentlyAssigned) {
+      result.push(pin);
+      continue;
+    }
+    if (pinByIndex(pin).role !== "unused") continue;
+    if (fn === "encoder") {
+      if (pin + 1 >= PIN_COUNT || RESERVED_PINS.has(pin + 1)) continue;
+      if (pinByIndex(pin + 1).role !== "unused") continue;
+    }
+    result.push(pin);
+  }
+  return result;
+}
+
+// Releases a pin previously used by a sequencer function back to "unused",
+// undoing any encoder-pairing/shift-linkage it was part of.
+function clearSequencerPin(pin) {
+  const p = pinByIndex(pin);
+  if (p.role === "encoder_a" && pin + 1 < PIN_COUNT) {
+    const partner = pinByIndex(pin + 1);
+    if (partner.role === "encoder_b") partner.role = "unused";
+  }
+  if (p.role === "button_shift") {
+    state.pins.forEach((pp) => {
+      if (pp.role === "encoder_a" && pp.in_min === pin) pp.in_min = NO_SHIFT_PIN;
+    });
+  }
+  p.role = "unused";
+}
+
+function assignSequencerPin(stepIndex, fn, pin) {
+  const step = state.sequencer.steps[stepIndex];
+  const field = fn + "_pin";
+  const prevPin = step[field];
+  if (prevPin !== null && prevPin !== undefined && prevPin !== pin) {
+    clearSequencerPin(prevPin);
+  }
+  step[field] = pin === null || pin === undefined ? null : pin;
+
+  if (pin !== null && pin !== undefined) {
+    const p = pinByIndex(pin);
+    const ch = state.sequencer.channel;
+    if (fn === "button") {
+      p.role = "button_cc";
+      p.toggle = true;
+      p.channel = ch;
+      p.number = SEQ_BASE.button + stepIndex;
+    } else if (fn === "encoder") {
+      p.role = "encoder_a";
+      p.channel = ch;
+      p.number = SEQ_BASE.encoder + stepIndex;
+      p.in_min = NO_SHIFT_PIN;
+      if (pin + 1 < PIN_COUNT && !RESERVED_PINS.has(pin + 1)) {
+        const partner = pinByIndex(pin + 1);
+        partner.role = "encoder_b";
+        partner.channel = ch;
+        partner.number = p.number;
+      }
+      if (step.shift_pin !== null && step.shift_pin !== undefined) {
+        p.in_min = step.shift_pin;
+        p.out_min = ch;
+        p.out_max = SEQ_BASE.encoder_shifted + stepIndex;
+      }
+    } else if (fn === "shift") {
+      p.role = "button_shift";
+      if (step.encoder_pin !== null && step.encoder_pin !== undefined) {
+        const enc = pinByIndex(step.encoder_pin);
+        enc.in_min = pin;
+        enc.out_min = ch;
+        enc.out_max = SEQ_BASE.encoder_shifted + stepIndex;
+      }
+    } else if (fn === "active_light" || fn === "step_light") {
+      p.role = "light_digital";
+      p.match_cc = true;
+      p.channel = ch;
+      p.number = (fn === "active_light" ? SEQ_BASE.active_light : SEQ_BASE.step_light) + stepIndex;
+    }
+  }
+
+  scheduleAutoSave();
+  scheduleSequencerSave();
+  renderAll();
+}
+
+function setStepCount(n) {
+  n = Math.max(1, Math.min(SEQ_MAX_STEPS, n || 1));
+  const steps = state.sequencer.steps;
+  if (n < steps.length) {
+    for (let i = n; i < steps.length; i++) {
+      Object.keys(SEQ_FN_LABELS).forEach((fn) => {
+        const pin = steps[i][fn + "_pin"];
+        if (pin !== null && pin !== undefined) clearSequencerPin(pin);
+      });
+    }
+    steps.length = n;
+  } else {
+    while (steps.length < n) steps.push(blankSequencerStep());
+  }
+  scheduleAutoSave();
+  scheduleSequencerSave();
+  renderAll();
+}
+
+function setSequencerChannel(value) {
+  state.sequencer.channel = value;
+  // keep every already-assigned sequencer pin's channel (and an active
+  // shift group's shifted channel) in sync with the new setting
+  state.sequencer.steps.forEach((step) => {
+    ["button", "encoder", "active_light", "step_light"].forEach((fn) => {
+      const pin = step[fn + "_pin"];
+      if (pin !== null && pin !== undefined) pinByIndex(pin).channel = value;
+    });
+    if (step.encoder_pin !== null && step.encoder_pin !== undefined) {
+      const enc = pinByIndex(step.encoder_pin);
+      if (enc.in_min !== NO_SHIFT_PIN) enc.out_min = value;
+      if (step.encoder_pin + 1 < PIN_COUNT) pinByIndex(step.encoder_pin + 1).channel = value;
+    }
+  });
+  scheduleAutoSave();
+  scheduleSequencerSave();
+  renderAll();
+}
+
+function setSequencerSubdivision(value) {
+  state.sequencer.subdivision = value;
+  scheduleSequencerSave();
+}
+
+function setStepNote(stepIndex, note) {
+  state.sequencer.steps[stepIndex].note = note;
+  scheduleSequencerSave();
+}
+
+async function toggleStepEnabledUI(stepIndex) {
+  await api("toggle_step_enabled", state.selectedId, stepIndex);
+}
+
+function scheduleSequencerSave() {
+  if (!state.selectedId || state.selectedId === ALL_DEVICES_ID) return;
+  const id = state.selectedId;
+  clearTimeout(sequencerSaveTimer);
+  sequencerSaveTimer = setTimeout(async () => {
+    const snapshot = JSON.parse(JSON.stringify(state.sequencer));
+    await api("update_entry_sequencer", id, snapshot);
+  }, 400);
 }
 
 // ---- rendering: table view -------------------------------------------------
@@ -638,6 +833,166 @@ function renderEncoderShiftFields(pin, p, fields) {
   }
 }
 
+// ---- rendering: sequencer view ----------------------------------------------
+
+function renderSequencerTab() {
+  renderSequencerSettings();
+  renderSequencerSteps();
+}
+
+function renderSequencerSettings() {
+  const el = document.getElementById("sequencerSettings");
+  el.innerHTML = "";
+  const seq = state.sequencer;
+
+  const countRow = document.createElement("div");
+  countRow.className = "field-row";
+  const countLabel = document.createElement("label");
+  countLabel.textContent = "Steps";
+  const countInput = document.createElement("input");
+  countInput.type = "number";
+  countInput.min = 1;
+  countInput.max = SEQ_MAX_STEPS;
+  countInput.value = seq.steps.length;
+  countInput.addEventListener("change", () => setStepCount(parseInt(countInput.value, 10)));
+  countRow.appendChild(countLabel);
+  countRow.appendChild(countInput);
+  el.appendChild(countRow);
+
+  const subRow = document.createElement("div");
+  subRow.className = "field-row";
+  const subLabel = document.createElement("label");
+  subLabel.textContent = "Subdivision";
+  const subSelect = document.createElement("select");
+  [
+    ["8th", "8th notes"],
+    ["16th", "16th notes"],
+    ["32nd", "32nd notes"],
+    ["16th_triplet", "16th-note triplets"],
+  ].forEach(([value, text]) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = text;
+    if (value === seq.subdivision) opt.selected = true;
+    subSelect.appendChild(opt);
+  });
+  subSelect.addEventListener("change", () => setSequencerSubdivision(subSelect.value));
+  subRow.appendChild(subLabel);
+  subRow.appendChild(subSelect);
+  el.appendChild(subRow);
+
+  const chRow = document.createElement("div");
+  chRow.className = "field-row";
+  const chLabel = document.createElement("label");
+  chLabel.textContent = "MIDI Channel";
+  const chInput = document.createElement("input");
+  chInput.type = "number";
+  chInput.min = 1;
+  chInput.max = 16;
+  chInput.value = seq.channel + 1;
+  chInput.addEventListener("change", () => {
+    const v = Math.max(1, Math.min(16, parseInt(chInput.value, 10) || 1)) - 1;
+    setSequencerChannel(v);
+  });
+  chRow.appendChild(chLabel);
+  chRow.appendChild(chInput);
+  el.appendChild(chRow);
+
+  const hint = document.createElement("div");
+  hint.className = "field-hint";
+  hint.textContent =
+    "Slaved to external MIDI Clock/Start/Stop/Continue only — stays idle until a DAW sends one.";
+  el.appendChild(hint);
+}
+
+function buildSequencerPinSelect(stepIndex, fn, currentPin) {
+  const wrap = document.createElement("div");
+  wrap.className = "field-row";
+  const label = document.createElement("label");
+  label.textContent = SEQ_FN_LABELS[fn];
+  wrap.appendChild(label);
+
+  const select = document.createElement("select");
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+  noneOpt.textContent = "Unassigned";
+  select.appendChild(noneOpt);
+
+  const eligible = sequencerEligiblePins(stepIndex, fn);
+  eligible.forEach((pin) => {
+    const opt = document.createElement("option");
+    opt.value = String(pin);
+    opt.textContent = `${pinLabel(pin)} (#${pin})`;
+    select.appendChild(opt);
+  });
+  select.value = currentPin === null || currentPin === undefined ? "" : String(currentPin);
+
+  select.addEventListener("change", () => {
+    assignSequencerPin(stepIndex, fn, select.value === "" ? null : parseInt(select.value, 10));
+  });
+  wrap.appendChild(select);
+
+  if (eligible.length === 0 && (currentPin === null || currentPin === undefined)) {
+    const hint = document.createElement("span");
+    hint.className = "field-hint";
+    hint.textContent = "No free pins available";
+    wrap.appendChild(hint);
+  }
+  return wrap;
+}
+
+function renderSequencerSteps() {
+  const container = document.getElementById("sequencerSteps");
+  container.innerHTML = "";
+  const live = state.sequencerLive;
+  const entry = selectedEntry();
+  const canToggleLive = !!(entry && entry.entry_type === "device" && entry.connected && live);
+
+  state.sequencer.steps.forEach((step, i) => {
+    const row = document.createElement("div");
+    row.className = "sequencer-step";
+    if (live && live.running && live.current_step === i) row.classList.add("playhead");
+
+    const heading = document.createElement("div");
+    heading.className = "sequencer-step-heading";
+    heading.textContent = `Step ${i + 1}`;
+    row.appendChild(heading);
+
+    const enabledLabel = document.createElement("label");
+    enabledLabel.className = "checkbox-label";
+    const enabledInput = document.createElement("input");
+    enabledInput.type = "checkbox";
+    enabledInput.checked = canToggleLive ? !!live.step_enabled[i] : false;
+    enabledInput.disabled = !canToggleLive;
+    enabledInput.addEventListener("change", () => toggleStepEnabledUI(i));
+    enabledLabel.appendChild(enabledInput);
+    enabledLabel.appendChild(document.createTextNode(" On"));
+    row.appendChild(enabledLabel);
+    if (!canToggleLive) {
+      const hint = document.createElement("span");
+      hint.className = "field-hint";
+      hint.textContent = "Connect the device to toggle steps";
+      row.appendChild(hint);
+    }
+
+    const noteRow = document.createElement("div");
+    noteRow.className = "field-row";
+    const noteLabel = document.createElement("label");
+    noteLabel.textContent = "Note";
+    noteRow.appendChild(noteLabel);
+    noteRow.appendChild(buildNoteSelect(step.note, (v) => setStepNote(i, v)));
+    row.appendChild(noteRow);
+
+    row.appendChild(buildSequencerPinSelect(i, "button", step.button_pin));
+    row.appendChild(buildSequencerPinSelect(i, "encoder", step.encoder_pin));
+    row.appendChild(buildSequencerPinSelect(i, "shift", step.shift_pin));
+    row.appendChild(buildSequencerPinSelect(i, "active_light", step.active_light_pin));
+    row.appendChild(buildSequencerPinSelect(i, "step_light", step.step_light_pin));
+
+    container.appendChild(row);
+  });
+}
+
 // ---- sidebar ----------------------------------------------------------------
 
 function sortedEntries() {
@@ -924,11 +1279,14 @@ async function applyDraftToDevice(draftId, deviceId) {
 async function selectEntry(id) {
   state.selectedId = id;
   state.selectedPin = null;
+  state.sequencerLive = null;
   if (id === ALL_DEVICES_ID) {
     state.pins = [];
+    state.sequencer = { channel: 0, subdivision: "16th", steps: [] };
   } else {
     const dict = await api("get_entry", id);
     state.pins = dict.pins;
+    state.sequencer = dict.sequencer;
   }
   renderAll();
 }
@@ -943,6 +1301,7 @@ async function readFromDevice() {
   }
   if (state.selectedId === id) {
     state.pins = dict.pins;
+    state.sequencer = dict.sequencer;
     state.selectedPin = null;
     renderAll();
   }
@@ -1034,6 +1393,7 @@ function renderAll() {
     renderTable();
     renderBoard();
     renderEditor();
+    renderSequencerTab();
   }
   renderSidebar();
   renderHeader();
@@ -1062,6 +1422,9 @@ function initEventListeners() {
       document
         .getElementById("boardView")
         .classList.toggle("active", state.view === "board");
+      document
+        .getElementById("sequencerView")
+        .classList.toggle("active", state.view === "sequencer");
     });
   });
 
@@ -1078,6 +1441,13 @@ function initEventListeners() {
     const entry = selectedEntry();
     if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
     e.detail.pins.forEach(({ pin, value }) => flashPin(pin, value));
+  });
+
+  window.addEventListener("sequencer_state", (e) => {
+    const entry = selectedEntry();
+    if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
+    state.sequencerLive = e.detail;
+    renderSequencerSteps();
   });
 }
 

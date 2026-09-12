@@ -6,7 +6,7 @@ EEPROM blob format (protocol.py). One JSON file per entry, in ENTRIES_DIR."""
 import dataclasses
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import protocol
 
@@ -78,6 +78,59 @@ class PinConfig:
         return dataclasses.astuple(a) == dataclasses.astuple(b)
 
 
+DEFAULT_STEP_COUNT = 4
+
+
+@dataclasses.dataclass
+class SequencerStepConfig:
+    """One step's physical control cluster. Pin fields are pin indices (or
+    None if that function isn't wired up yet) — the button also serves as
+    the step's on/off toggle (no separate mute), and note/velocity never
+    change dynamically once triggered."""
+    note: int = 60
+    button_pin: Optional[int] = None
+    encoder_pin: Optional[int] = None  # encoder_a pin index; pin+1 is encoder_b
+    shift_pin: Optional[int] = None
+    active_light_pin: Optional[int] = None
+    step_light_pin: Optional[int] = None
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_dict(d) -> "SequencerStepConfig":
+        return SequencerStepConfig(**d)
+
+
+@dataclasses.dataclass
+class SequencerConfig:
+    """App-only sequencer config for an Entry: which pin plays which role for
+    each step, plus the shared subdivision/channel. Not part of the EEPROM
+    blob — the step pattern (on/off) and playback position live in memory
+    only, on the DeviceSession's SequencerEngine, not here."""
+    channel: int = 0
+    subdivision: str = "16th"  # "8th" | "16th" | "32nd" | "16th_triplet"
+    steps: List[SequencerStepConfig] = dataclasses.field(
+        default_factory=lambda: [SequencerStepConfig() for _ in range(DEFAULT_STEP_COUNT)]
+    )
+
+    def to_dict(self):
+        return {
+            "channel": self.channel,
+            "subdivision": self.subdivision,
+            "steps": [s.to_dict() for s in self.steps],
+        }
+
+    @staticmethod
+    def from_dict(d) -> "SequencerConfig":
+        steps = [SequencerStepConfig.from_dict(s) for s in d.get("steps", [])]
+        return SequencerConfig(
+            channel=d.get("channel", 0),
+            subdivision=d.get("subdivision", "16th"),
+            steps=steps or [SequencerStepConfig() for _ in range(DEFAULT_STEP_COUNT)],
+        )
+
+
 @dataclasses.dataclass
 class Entry:
     id: str  # str(device_id) for a device entry, "draft-<hex>" for a draft
@@ -85,6 +138,7 @@ class Entry:
     nickname: str
     pins: List[PinConfig] = dataclasses.field(default_factory=list)
     device_id: int = 0  # meaningful only when entry_type == "device"
+    sequencer: SequencerConfig = dataclasses.field(default_factory=SequencerConfig)
 
     @staticmethod
     def blank(id_: str, entry_type: str, nickname: str, device_id: int = 0) -> "Entry":
@@ -111,6 +165,7 @@ class Entry:
             "nickname": self.nickname,
             "device_id": self.device_id,
             "pins": [p.to_dict() for p in self.pins],
+            "sequencer": self.sequencer.to_dict(),
         }
 
     @staticmethod
@@ -121,6 +176,7 @@ class Entry:
             nickname=d.get("nickname", d["id"]),
             device_id=d.get("device_id", 0),
             pins=[PinConfig.from_dict(p) for p in d["pins"]],
+            sequencer=SequencerConfig.from_dict(d["sequencer"]) if "sequencer" in d else SequencerConfig(),
         )
 
     @staticmethod

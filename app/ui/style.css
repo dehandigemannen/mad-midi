@@ -505,3 +505,65 @@ button:disabled {
 .mline .dev { width: 90px; flex-shrink: 0; color: var(--accent); overflow: hidden; text-overflow: ellipsis; }
 .mline .decoded { min-width: 220px; }
 .mline .raw { color: var(--text-dim); }
+
+/* ---- sequencer view ---- */
+
+#sequencerSettings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-end;
+  padding-bottom: 14px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+#sequencerSettings .field-row {
+  margin-bottom: 0;
+  min-width: 120px;
+}
+
+#sequencerSettings .field-hint {
+  flex-basis: 100%;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+#sequencerSteps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sequencer-step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 14px;
+  padding: 10px 12px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.sequencer-step .field-row {
+  margin-bottom: 0;
+  min-width: 130px;
+}
+
+.sequencer-step .field-hint {
+  margin: 0;
+}
+
+.sequencer-step-heading {
+  font-weight: 600;
+  font-size: 12px;
+  flex-basis: 60px;
+  flex-shrink: 0;
+}
+
+.sequencer-step.playhead {
+  border-color: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}

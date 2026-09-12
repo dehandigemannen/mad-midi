@@ -16,6 +16,7 @@ import flasher
 import protocol
 import serial_link
 from midi_bridge import MidiBridge
+from sequencer import SequencerEngine
 
 UI_DIR = Path(__file__).parent / "ui"
 
@@ -42,6 +43,7 @@ class DeviceSession:
         self.config_format_version = None
         self.active_pins = None  # list[config_model.PinConfig] once known
         self.baseline_pins = None  # snapshot of what's actually flashed to the device
+        self.sequencer: Optional[SequencerEngine] = None
 
         self._api = api
         self.link = serial_link.SerialLink(
@@ -50,7 +52,12 @@ class DeviceSession:
         )
         self.link.connect(port)
         out_name, in_name = _virtual_port_names(port, self.device_id)
-        self.bridge = MidiBridge(on_from_daw=self._on_daw_message, out_name=out_name, in_name=in_name)
+        self.bridge = MidiBridge(
+            on_from_daw=self._on_daw_message,
+            on_realtime=self._on_realtime,
+            out_name=out_name,
+            in_name=in_name,
+        )
 
     def identify(self):
         """Briefly enters config mode to read device id/versions, then resumes."""
@@ -67,17 +74,46 @@ class DeviceSession:
     def _rebuild_bridge(self):
         self.bridge.close()
         out_name, in_name = _virtual_port_names(self.port, self.device_id)
-        self.bridge = MidiBridge(on_from_daw=self._on_daw_message, out_name=out_name, in_name=in_name)
+        self.bridge = MidiBridge(
+            on_from_daw=self._on_daw_message,
+            on_realtime=self._on_realtime,
+            out_name=out_name,
+            in_name=in_name,
+        )
+
+    def rebuild_sequencer(self, sequencer_config: config_model.SequencerConfig, pins):
+        if self.sequencer:
+            self.sequencer.close()
+        self.sequencer = SequencerEngine(
+            sequencer_config,
+            pins,
+            send_to_daw=self.bridge.send_to_daw,
+            send_to_device=self.link.send_midi_to_device,
+            on_state_change=self._on_sequencer_state,
+        )
 
     def close(self):
+        if self.sequencer:
+            self.sequencer.close()
         self.link.disconnect()
         self.bridge.close()
 
     def _on_device_midi(self, raw: bytes):
+        if self.sequencer and len(raw) >= 3:
+            channel = raw[0] & 0x0F
+            if self.sequencer.handle_incoming_pin_message(channel, raw[1]):
+                return
         self.bridge.send_to_daw(raw)
 
     def _on_daw_message(self, raw: bytes):
         self.link.send_midi_to_device(raw)
+
+    def _on_realtime(self, kind: str):
+        if self.sequencer:
+            self.sequencer.handle_realtime(kind)
+
+    def _on_sequencer_state(self, state: dict):
+        self._api._emit("sequencer_state", {"device_id": self.device_id, **state})
 
     def _on_monitor(self, direction, kind, raw: bytes):
         self._api._emit("monitor_event", {
@@ -187,16 +223,40 @@ class Api:
         session = self._session_for_device(entry.device_id) if entry.entry_type == "device" else None
         if session:
             session.active_pins = entry.pins
+            session.rebuild_sequencer(entry.sequencer, entry.pins)
         return self._entry_status(entry)
+
+    def update_entry_sequencer(self, id_: str, sequencer_dict):
+        """Debounced auto-save call fired from the Sequencer tab on every edit."""
+        entry = config_model.Entry.load(id_)
+        entry.sequencer = config_model.SequencerConfig.from_dict(sequencer_dict)
+        entry.save()
+        session = self._session_for_device(entry.device_id) if entry.entry_type == "device" else None
+        if session:
+            session.rebuild_sequencer(entry.sequencer, entry.pins)
+        return self._entry_status(entry)
+
+    def toggle_step_enabled(self, id_: str, step_index: int):
+        """Software fallback for a step's on/off toggle (no physical button
+        required) — mirrors what pressing the step's button pin does."""
+        entry = config_model.Entry.load(id_)
+        session = self._session_for_device(entry.device_id) if entry.entry_type == "device" else None
+        if session and session.sequencer:
+            session.sequencer.set_step_enabled(
+                step_index, not session.sequencer.step_enabled[step_index]
+            )
+        return True
 
     def apply_draft(self, draft_id: str, device_entry_id: str):
         draft = config_model.Entry.load(draft_id)
         device_entry = config_model.Entry.load(device_entry_id)
         device_entry.pins = draft.pins
+        device_entry.sequencer = draft.sequencer
         device_entry.save()
         session = self._session_for_device(device_entry.device_id)
         if session:
             session.active_pins = device_entry.pins
+            session.rebuild_sequencer(device_entry.sequencer, device_entry.pins)
         return self._entry_status(device_entry)
 
     # ---- device adoption ----------------------------------------------
@@ -263,6 +323,7 @@ class Api:
             config_model.Entry.from_blob(id_, entry.nickname, blob).pins if blob is not None else None
         )
         session.active_pins = entry.pins
+        session.rebuild_sequencer(entry.sequencer, entry.pins)
         return entry.to_dict()
 
     def reconnect_entry(self, id_: str, port: str):
@@ -293,6 +354,7 @@ class Api:
             config_model.Entry.from_blob(id_, entry.nickname, blob).pins if blob is not None else None
         )
         session.active_pins = entry.pins
+        session.rebuild_sequencer(entry.sequencer, entry.pins)
         return {"ok": True, **self._entry_status(entry)}
 
     def disconnect_entry(self, id_: str):
@@ -331,8 +393,10 @@ class Api:
         if blob is None:
             return None
         fresh = config_model.Entry.from_blob(id_, entry.nickname, blob)
+        fresh.sequencer = entry.sequencer  # not part of the EEPROM blob — preserve it
         session.baseline_pins = fresh.pins
         session.active_pins = fresh.pins
+        session.rebuild_sequencer(fresh.sequencer, fresh.pins)
         fresh.save()
         return fresh.to_dict()
 
