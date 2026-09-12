@@ -66,7 +66,7 @@ const SEQ_BASE = {
   button: 0,
   encoder: 8,
   encoder_shifted: 16,
-  active_light: 24,
+  pwm: 24,
   step_light: 32,
 };
 const SEQ_MAX_STEPS = 8;
@@ -74,9 +74,12 @@ const SEQ_FN_LABELS = {
   button: "Button",
   encoder: "Encoder",
   shift: "Shift",
-  active_light: "Active light",
+  pwm: "PWM (value)",
   step_light: "Step light",
 };
+// Functions that need a genuinely PWM-capable pin, vs. functions that
+// should steer clear of them so those pins stay free for PWM use.
+const SEQ_FNS_NEEDING_PWM = new Set(["pwm"]);
 
 const FIELD_META = {
   channel: {
@@ -123,7 +126,7 @@ function usesNoteName(p) {
 }
 
 function displayNumber(p) {
-  if (p.role === "unused" || p.role === "encoder_b") return "";
+  if (!ROLE_FIELDS[p.role].includes("number")) return ""; // e.g. button_shift sends no MIDI at all
   return usesNoteName(p) ? `${noteNumberToName(p.number)} (${p.number})` : String(p.number);
 }
 
@@ -133,7 +136,11 @@ function isAnalogPin(pin) {
 
 function allowedRoles(pin) {
   if (RESERVED_PINS.has(pin)) return [];
-  if (isAnalogPin(pin)) return ["unused", "pot_cc"];
+  // A0-A15 are ordinary digital I/O pins that also happen to have ADC —
+  // digitalWrite works on them the same as any other pin, so a plain on/off
+  // light is a legitimate use (e.g. a sequencer step light), just not PWM
+  // (the Mega has no PWM hardware on these pins).
+  if (isAnalogPin(pin)) return ["unused", "pot_cc", "light_digital"];
   const roles = [
     "unused",
     "button_note",
@@ -167,7 +174,6 @@ const state = {
 };
 
 let saveTimer = null;
-let sequencerSaveTimer = null;
 
 function pinByIndex(i) {
   return state.pins[i];
@@ -220,12 +226,16 @@ function setPinField(pin, field, value) {
 // ---- auto-save -------------------------------------------------------------
 
 function scheduleAutoSave() {
+  // Saves pins and sequencer together in one call — they used to be two
+  // independent debounced saves and could race each other into corrupting
+  // the file when both fired ~400ms apart (see update_entry_pins).
   if (!state.selectedId || state.selectedId === ALL_DEVICES_ID) return;
   const id = state.selectedId;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     const pinsSnapshot = state.pins.map((p) => ({ ...p }));
-    const status = await api("update_entry_pins", id, pinsSnapshot);
+    const sequencerSnapshot = JSON.parse(JSON.stringify(state.sequencer));
+    const status = await api("update_entry_pins", id, pinsSnapshot, sequencerSnapshot);
     applyEntryStatus(status);
   }, 400);
 }
@@ -242,13 +252,13 @@ function applyEntryStatus(status) {
 
 // ---- sequencer: pin assignment (mirrors setPinRole's cleanup-then-assign) --
 
-function blankSequencerStep() {
+function blankSequencerStep(index) {
   return {
-    note: 60,
+    note: 60 + index, // auto-assigned, still freely editable via the Note dropdown
     button_pin: null,
     encoder_pin: null,
     shift_pin: null,
-    active_light_pin: null,
+    pwm_pin: null,
     step_light_pin: null,
   };
 }
@@ -256,12 +266,18 @@ function blankSequencerStep() {
 // Pins currently eligible for a given step's function: unused, or already
 // holding that exact slot. Encoder additionally needs a free pin+1 (its
 // encoder_b partner), same constraint setPinRole already applies elsewhere.
-// This is what makes "not enough free pins" a natural block: once nothing
-// is unused, the dropdown simply has nothing else to offer.
+// PWM-capable pins are reserved for the "pwm" function and excluded from
+// every other function's dropdown, and vice versa. This is what makes "not
+// enough free pins" a natural block: once nothing is unused, the dropdown
+// simply has nothing else to offer.
 function sequencerEligiblePins(stepIndex, fn) {
   const step = state.sequencer.steps[stepIndex];
   const currentlyAssigned = step[fn + "_pin"];
-  const maxPin = fn === "encoder" ? 53 : 54; // encoder_a needs pin < 53, like allowedRoles()
+  const needsPwm = SEQ_FNS_NEEDING_PWM.has(fn);
+  // step_light can also live on an analog pin (plain digitalWrite works
+  // there); every other function needs a digital pin (button/shift/encoder
+  // for input, pwm for actual PWM hardware, which analog pins don't have).
+  const maxPin = fn === "encoder" ? 53 : fn === "step_light" ? PIN_COUNT : 54;
   const result = [];
   for (let pin = 0; pin < maxPin; pin++) {
     if (RESERVED_PINS.has(pin)) continue;
@@ -269,6 +285,7 @@ function sequencerEligiblePins(stepIndex, fn) {
       result.push(pin);
       continue;
     }
+    if (PWM_PINS.has(pin) !== needsPwm) continue;
     if (pinByIndex(pin).role !== "unused") continue;
     if (fn === "encoder") {
       if (pin + 1 >= PIN_COUNT || RESERVED_PINS.has(pin + 1)) continue;
@@ -309,7 +326,11 @@ function assignSequencerPin(stepIndex, fn, pin) {
     const ch = state.sequencer.channel;
     if (fn === "button") {
       p.role = "button_cc";
-      p.toggle = true;
+      // A latching switch, not momentary — level mode (toggle=false) sends
+      // the switch's actual current position on every edge, staying in
+      // sync even across a reconnect; toggle=true only advances on a fresh
+      // press edge and would drift from the switch's real position.
+      p.toggle = false;
       p.channel = ch;
       p.number = SEQ_BASE.button + stepIndex;
     } else if (fn === "encoder") {
@@ -336,16 +357,25 @@ function assignSequencerPin(stepIndex, fn, pin) {
         enc.out_min = ch;
         enc.out_max = SEQ_BASE.encoder_shifted + stepIndex;
       }
-    } else if (fn === "active_light" || fn === "step_light") {
+    } else if (fn === "step_light") {
       p.role = "light_digital";
       p.match_cc = true;
       p.channel = ch;
-      p.number = (fn === "active_light" ? SEQ_BASE.active_light : SEQ_BASE.step_light) + stepIndex;
+      p.number = SEQ_BASE.step_light + stepIndex;
+    } else if (fn === "pwm") {
+      // Value meter: mirrors the encoder's live CC output as PWM brightness.
+      p.role = "light_pwm";
+      p.match_cc = true;
+      p.channel = ch;
+      p.number = SEQ_BASE.pwm + stepIndex;
+      p.in_min = 0;
+      p.in_max = 127;
+      p.out_min = 0;
+      p.out_max = 255;
     }
   }
 
   scheduleAutoSave();
-  scheduleSequencerSave();
   renderAll();
 }
 
@@ -361,10 +391,9 @@ function setStepCount(n) {
     }
     steps.length = n;
   } else {
-    while (steps.length < n) steps.push(blankSequencerStep());
+    while (steps.length < n) steps.push(blankSequencerStep(steps.length));
   }
   scheduleAutoSave();
-  scheduleSequencerSave();
   renderAll();
 }
 
@@ -373,7 +402,7 @@ function setSequencerChannel(value) {
   // keep every already-assigned sequencer pin's channel (and an active
   // shift group's shifted channel) in sync with the new setting
   state.sequencer.steps.forEach((step) => {
-    ["button", "encoder", "active_light", "step_light"].forEach((fn) => {
+    ["button", "encoder", "pwm", "step_light"].forEach((fn) => {
       const pin = step[fn + "_pin"];
       if (pin !== null && pin !== undefined) pinByIndex(pin).channel = value;
     });
@@ -384,32 +413,21 @@ function setSequencerChannel(value) {
     }
   });
   scheduleAutoSave();
-  scheduleSequencerSave();
   renderAll();
 }
 
 function setSequencerSubdivision(value) {
   state.sequencer.subdivision = value;
-  scheduleSequencerSave();
+  scheduleAutoSave();
 }
 
 function setStepNote(stepIndex, note) {
   state.sequencer.steps[stepIndex].note = note;
-  scheduleSequencerSave();
+  scheduleAutoSave();
 }
 
 async function toggleStepEnabledUI(stepIndex) {
   await api("toggle_step_enabled", state.selectedId, stepIndex);
-}
-
-function scheduleSequencerSave() {
-  if (!state.selectedId || state.selectedId === ALL_DEVICES_ID) return;
-  const id = state.selectedId;
-  clearTimeout(sequencerSaveTimer);
-  sequencerSaveTimer = setTimeout(async () => {
-    const snapshot = JSON.parse(JSON.stringify(state.sequencer));
-    await api("update_entry_sequencer", id, snapshot);
-  }, 400);
 }
 
 // ---- rendering: table view -------------------------------------------------
@@ -487,9 +505,7 @@ function buildTableRow(pin) {
     );
     tr.appendChild(
       cell(
-        p.role === "unused" || p.role === "encoder_b"
-          ? ""
-          : String(p.channel + 1),
+        ROLE_FIELDS[p.role].includes("channel") ? String(p.channel + 1) : "",
       ),
     );
     tr.appendChild(cell(displayNumber(p)));
@@ -941,6 +957,29 @@ function buildSequencerPinSelect(stepIndex, fn, currentPin) {
   return wrap;
 }
 
+// Makes the encoder/shift link (set automatically by assignSequencerPin,
+// whichever order the two are assigned in) visible — otherwise there's no
+// way to tell from this tab alone that turning the encoder while holding
+// shift actually sends a different CC.
+function buildEncoderShiftLinkHint(step) {
+  const hint = document.createElement("div");
+  hint.className = "field-hint sequencer-link-hint";
+  const hasEncoder = step.encoder_pin !== null && step.encoder_pin !== undefined;
+  const hasShift = step.shift_pin !== null && step.shift_pin !== undefined;
+
+  if (hasEncoder && hasShift) {
+    const enc = pinByIndex(step.encoder_pin);
+    hint.textContent = `✓ Shift linked — plain turn sends CC ${enc.number}, shift+turn sends CC ${enc.out_max} (both on channel ${enc.channel + 1})`;
+  } else if (hasEncoder && !hasShift) {
+    hint.textContent = "No shift assigned — this encoder always sends its plain CC.";
+  } else if (!hasEncoder && hasShift) {
+    hint.textContent = "This shift button isn't linked to anything yet — assign this step's encoder to link it.";
+  } else {
+    hint.hidden = true;
+  }
+  return hint;
+}
+
 function renderSequencerSteps() {
   const container = document.getElementById("sequencerSteps");
   container.innerHTML = "";
@@ -986,8 +1025,9 @@ function renderSequencerSteps() {
     row.appendChild(buildSequencerPinSelect(i, "button", step.button_pin));
     row.appendChild(buildSequencerPinSelect(i, "encoder", step.encoder_pin));
     row.appendChild(buildSequencerPinSelect(i, "shift", step.shift_pin));
-    row.appendChild(buildSequencerPinSelect(i, "active_light", step.active_light_pin));
+    row.appendChild(buildSequencerPinSelect(i, "pwm", step.pwm_pin));
     row.appendChild(buildSequencerPinSelect(i, "step_light", step.step_light_pin));
+    row.appendChild(buildEncoderShiftLinkHint(step));
 
     container.appendChild(row);
   });

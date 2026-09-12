@@ -84,14 +84,17 @@ DEFAULT_STEP_COUNT = 4
 @dataclasses.dataclass
 class SequencerStepConfig:
     """One step's physical control cluster. Pin fields are pin indices (or
-    None if that function isn't wired up yet) — the button also serves as
-    the step's on/off toggle (no separate mute), and note/velocity never
-    change dynamically once triggered."""
+    None if that function isn't wired up yet). The button is a latching
+    switch — its own light is expected to be wired directly to it in
+    hardware, not driven by this app — and it doubles as the step's on/off
+    control (no separate mute). Note/velocity never change dynamically once
+    triggered. pwm_pin mirrors the encoder's live CC output as PWM brightness
+    (a value meter, not an enabled/disabled indicator)."""
     note: int = 60
     button_pin: Optional[int] = None
     encoder_pin: Optional[int] = None  # encoder_a pin index; pin+1 is encoder_b
     shift_pin: Optional[int] = None
-    active_light_pin: Optional[int] = None
+    pwm_pin: Optional[int] = None
     step_light_pin: Optional[int] = None
 
     def to_dict(self):
@@ -99,7 +102,10 @@ class SequencerStepConfig:
 
     @staticmethod
     def from_dict(d) -> "SequencerStepConfig":
-        return SequencerStepConfig(**d)
+        d = dict(d)
+        if "active_light_pin" in d:  # renamed — active light replaced by the PWM value meter
+            d.setdefault("pwm_pin", d.pop("active_light_pin"))
+        return SequencerStepConfig(**{k: v for k, v in d.items() if k in SequencerStepConfig.__dataclass_fields__})
 
 
 @dataclasses.dataclass
@@ -111,7 +117,7 @@ class SequencerConfig:
     channel: int = 0
     subdivision: str = "16th"  # "8th" | "16th" | "32nd" | "16th_triplet"
     steps: List[SequencerStepConfig] = dataclasses.field(
-        default_factory=lambda: [SequencerStepConfig() for _ in range(DEFAULT_STEP_COUNT)]
+        default_factory=lambda: _default_steps(DEFAULT_STEP_COUNT)
     )
 
     def to_dict(self):
@@ -127,8 +133,14 @@ class SequencerConfig:
         return SequencerConfig(
             channel=d.get("channel", 0),
             subdivision=d.get("subdivision", "16th"),
-            steps=steps or [SequencerStepConfig() for _ in range(DEFAULT_STEP_COUNT)],
+            steps=steps or _default_steps(DEFAULT_STEP_COUNT),
         )
+
+
+def _default_steps(count: int) -> List[SequencerStepConfig]:
+    """Auto-assigns an incrementing note per step (still freely editable) so
+    a fresh sequencer is immediately usable without manual note entry."""
+    return [SequencerStepConfig(note=60 + i) for i in range(count)]
 
 
 @dataclasses.dataclass
@@ -184,9 +196,13 @@ class Entry:
         return directory / f"{id_}.json"
 
     def save(self, directory: Path = ENTRIES_DIR) -> Path:
+        """Writes via a temp file + atomic rename so a concurrent reader (or
+        an overlapping save) never sees a half-written/corrupted file."""
         directory.mkdir(parents=True, exist_ok=True)
         path = self._path(self.id, directory)
-        path.write_text(json.dumps(self.to_dict(), indent=2))
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(self.to_dict(), indent=2))
+        tmp_path.replace(path)
         return path
 
     @staticmethod

@@ -567,3 +567,9 @@ button:disabled {
   border-color: var(--accent);
   box-shadow: 0 0 8px var(--accent);
 }
+
+.sequencer-link-hint {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--text-dim);
+}

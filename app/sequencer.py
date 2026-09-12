@@ -20,6 +20,7 @@ import time
 from typing import Callable, List, Optional, Tuple
 
 import config_model
+import protocol
 
 TICKS_PER_QUARTER = 24  # MIDI clock standard: 24 clock messages per quarter note
 SUBDIVISION_TICKS = {
@@ -44,8 +45,18 @@ class _ResolvedStep:
     def __init__(self, step: config_model.SequencerStepConfig, pins: List[config_model.PinConfig]):
         self.note = step.note
         self.button = _resolve(pins, step.button_pin)
-        self.active_light = _resolve(pins, step.active_light_pin)
         self.step_light = _resolve(pins, step.step_light_pin)
+        self.pwm = _resolve(pins, step.pwm_pin)
+
+        # The PWM meter mirrors whichever CC the encoder is currently
+        # sending — plain or, if a shift group is configured, shifted too.
+        self.encoder_plain: Optional[Tuple[int, int]] = None
+        self.encoder_shifted: Optional[Tuple[int, int]] = None
+        if step.encoder_pin is not None and 0 <= step.encoder_pin < len(pins):
+            enc = pins[step.encoder_pin]
+            self.encoder_plain = (enc.channel, enc.number)
+            if enc.in_min != protocol.NO_SHIFT_PIN:
+                self.encoder_shifted = (enc.out_min, enc.out_max)
 
 
 def _resolve(pins: List[config_model.PinConfig], pin_index: Optional[int]) -> Optional[Tuple[int, int]]:
@@ -128,7 +139,7 @@ class SequencerEngine:
         note_on = bytes([0x90 | self.channel, step.note & 0x7F, DEFAULT_VELOCITY])
         note_off = bytes([0x80 | self.channel, step.note & 0x7F, 0])
         self._send_to_daw(note_on)
-        self._set_light(step.step_light, True)
+        self._send_cc(step.step_light, 127)
 
         existing = self._off_timers[index]
         if existing is not None:
@@ -141,25 +152,34 @@ class SequencerEngine:
 
     def _end_step(self, index: int, note_off: bytes, step: _ResolvedStep) -> None:
         self._send_to_daw(note_off)
-        self._set_light(step.step_light, False)
+        self._send_cc(step.step_light, 0)
 
-    def _set_light(self, target: Optional[Tuple[int, int]], on: bool) -> None:
+    def _send_cc(self, target: Optional[Tuple[int, int]], value: int) -> None:
         if target is None:
             return
         channel, number = target
-        status = 0xB0 | (channel & 0x0F)  # light_digital pins are matched on CC here
-        self._send_to_device(bytes([status, number & 0x7F, 127 if on else 0]))
+        status = 0xB0 | (channel & 0x0F)
+        self._send_to_device(bytes([status, number & 0x7F, value & 0x7F]))
 
     # ---- incoming pin messages (from the device) -----------------------
 
-    def handle_incoming_pin_message(self, channel: int, number: int) -> bool:
+    def handle_incoming_pin_message(self, channel: int, number: int, value: int) -> bool:
         """Called for every MIDI message arriving from the device. Returns
         True if it was a sequencer step's button (consumed — caller must not
-        forward it to the DAW), False otherwise."""
+        forward it to the DAW), False otherwise (including an encoder match,
+        which still needs to reach the DAW — it's only observed here to
+        mirror its value onto the step's PWM meter)."""
         for index, step in enumerate(self._steps):
             if step.button == (channel, number):
-                self.set_step_enabled(index, not self.step_enabled[index])
+                # The button is a latching switch wired for level (not
+                # toggle) mode: the incoming value already *is* the switch's
+                # current position, so set it directly rather than inverting
+                # — inverting would desync from the switch after a missed
+                # edge (e.g. a session reconnect while it sits mid-position).
+                self.set_step_enabled(index, value != 0)
                 return True
+            if step.pwm is not None and (step.encoder_plain == (channel, number) or step.encoder_shifted == (channel, number)):
+                self._send_cc(step.pwm, value)
         return False
 
     def set_step_enabled(self, index: int, enabled: bool) -> None:
@@ -167,7 +187,6 @@ class SequencerEngine:
             return
         with self._lock:
             self.step_enabled[index] = enabled
-        self._set_light(self._steps[index].active_light, enabled)
         self._emit_state()
 
     # ---- state ------------------------------------------------------------

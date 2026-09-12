@@ -12,24 +12,38 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config_model
+import protocol
 from sequencer import SUBDIVISION_TICKS, SequencerEngine
 
 
-def _make_engine(subdivision="16th", num_steps=2, button_pins=None):
+def _make_engine(subdivision="16th", num_steps=2, button_pins=None, encoder_pins=None, pwm_pins=None):
     steps = []
     for i in range(num_steps):
         step = config_model.SequencerStepConfig(note=60 + i)
         if button_pins and i in button_pins:
             step.button_pin = button_pins[i]
+        if encoder_pins and i in encoder_pins:
+            step.encoder_pin = encoder_pins[i]
+        if pwm_pins and i in pwm_pins:
+            step.pwm_pin = pwm_pins[i]
         steps.append(step)
     config = config_model.SequencerConfig(channel=9, subdivision=subdivision, steps=steps)
 
-    pins = [config_model.PinConfig(pin=i) for i in range(protocol_pin_count())]
+    pins = [config_model.PinConfig(pin=i) for i in range(protocol.PIN_COUNT)]
     for i, pin_index in (button_pins or {}).items():
         pins[pin_index].role = "button_cc"
-        pins[pin_index].toggle = True
+        pins[pin_index].toggle = False  # latching switch: level mode, not edge-toggled
         pins[pin_index].channel = 9
         pins[pin_index].number = 100 + i
+    for i, pin_index in (encoder_pins or {}).items():
+        pins[pin_index].role = "encoder_a"
+        pins[pin_index].channel = 9
+        pins[pin_index].number = 50 + i
+        pins[pin_index].in_min = protocol.NO_SHIFT_PIN
+    for i, pin_index in (pwm_pins or {}).items():
+        pins[pin_index].role = "light_pwm"
+        pins[pin_index].channel = 9
+        pins[pin_index].number = 70 + i
 
     daw_messages = []
     device_messages = []
@@ -42,11 +56,6 @@ def _make_engine(subdivision="16th", num_steps=2, button_pins=None):
         on_state_change=states.append,
     )
     return engine, daw_messages, device_messages, states
-
-
-def protocol_pin_count():
-    import protocol
-    return protocol.PIN_COUNT
 
 
 def _run_ticks(engine, count):
@@ -110,19 +119,44 @@ def test_stop_halts_and_continue_resumes_from_held_position():
     assert engine.current_step == held_step, "continue must resume from the held position, not step 0"
 
 
-def test_incoming_button_message_toggles_step_and_is_consumed():
-    engine, _daw_messages, device_messages, states = _make_engine(
+def test_incoming_button_message_sets_step_from_level_and_is_consumed():
+    """The button is a latching switch wired for level (not toggle) mode —
+    the incoming CC value already *is* the switch's position, so the engine
+    must set state directly from it rather than inverting (inverting would
+    desync from the switch's real position after any missed edge)."""
+    engine, _daw_messages, _device_messages, states = _make_engine(
         subdivision="16th", num_steps=2, button_pins={0: 5}
     )
     assert engine.step_enabled[0] is False
 
-    consumed = engine.handle_incoming_pin_message(channel=9, number=100)
+    consumed = engine.handle_incoming_pin_message(channel=9, number=100, value=127)
     assert consumed is True, "a step's button message must be consumed (suppressed from the DAW)"
     assert engine.step_enabled[0] is True
-    assert len(states) == 1 and states[0]["step_enabled"][0] is True
+    assert states[-1]["step_enabled"][0] is True
 
-    not_consumed = engine.handle_incoming_pin_message(channel=9, number=42)
+    # Two "on" messages in a row (e.g. debounce chatter) must not flip it off
+    # — a blind invert would get this wrong; a direct level-set does not.
+    engine.handle_incoming_pin_message(channel=9, number=100, value=127)
+    assert engine.step_enabled[0] is True
+
+    engine.handle_incoming_pin_message(channel=9, number=100, value=0)
+    assert engine.step_enabled[0] is False
+
+    not_consumed = engine.handle_incoming_pin_message(channel=9, number=42, value=127)
     assert not_consumed is False, "an unrelated message must be forwarded normally"
+
+
+def test_encoder_message_echoes_to_pwm_and_is_not_consumed():
+    engine, _daw_messages, device_messages, _states = _make_engine(
+        subdivision="16th", num_steps=1, encoder_pins={0: 10}, pwm_pins={0: 6}
+    )
+    consumed = engine.handle_incoming_pin_message(channel=9, number=50, value=1)
+    assert consumed is False, "an encoder turn must still reach the DAW, not be suppressed"
+    assert len(device_messages) == 1, "the PWM pin should have been driven to mirror the encoder's value"
+    status, number, value = device_messages[0]
+    assert status == 0xB0 | 9
+    assert number == 70  # this step's configured PWM CC number
+    assert value == 1
 
 
 if __name__ == "__main__":

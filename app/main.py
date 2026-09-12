@@ -101,7 +101,7 @@ class DeviceSession:
     def _on_device_midi(self, raw: bytes):
         if self.sequencer and len(raw) >= 3:
             channel = raw[0] & 0x0F
-            if self.sequencer.handle_incoming_pin_message(channel, raw[1]):
+            if self.sequencer.handle_incoming_pin_message(channel, raw[1], raw[2]):
                 return
         self.bridge.send_to_daw(raw)
 
@@ -215,24 +215,21 @@ class Api:
         config_model.Entry.delete(id_)
         return True
 
-    def update_entry_pins(self, id_: str, pins_dicts):
-        """Debounced auto-save call fired from the UI on every edit."""
+    def update_entry_pins(self, id_: str, pins_dicts, sequencer_dict=None):
+        """Debounced auto-save call fired from the UI on every edit — pins
+        and sequencer are always saved together in one read-modify-write, so
+        two independent debounced saves can never race and corrupt the file
+        (they used to: assigning a sequencer pin fired both this call and a
+        separate update_entry_sequencer call ~400ms apart, and two concurrent
+        non-atomic writes to the same file could interleave)."""
         entry = config_model.Entry.load(id_)
         entry.pins = [config_model.PinConfig.from_dict(p) for p in pins_dicts]
+        if sequencer_dict is not None:
+            entry.sequencer = config_model.SequencerConfig.from_dict(sequencer_dict)
         entry.save()
         session = self._session_for_device(entry.device_id) if entry.entry_type == "device" else None
         if session:
             session.active_pins = entry.pins
-            session.rebuild_sequencer(entry.sequencer, entry.pins)
-        return self._entry_status(entry)
-
-    def update_entry_sequencer(self, id_: str, sequencer_dict):
-        """Debounced auto-save call fired from the Sequencer tab on every edit."""
-        entry = config_model.Entry.load(id_)
-        entry.sequencer = config_model.SequencerConfig.from_dict(sequencer_dict)
-        entry.save()
-        session = self._session_for_device(entry.device_id) if entry.entry_type == "device" else None
-        if session:
             session.rebuild_sequencer(entry.sequencer, entry.pins)
         return self._entry_status(entry)
 
