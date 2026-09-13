@@ -115,6 +115,54 @@ While the referenced shift button is held, a turn sends relative CC on
 `(outMin, outMax)` instead of `(channel, number)` — same 1/127 encoding
 either way.
 
+## Sequencer
+
+An app-only step sequencer per device entry — not part of the wire
+protocol or EEPROM blob at all. It reuses the same pin-config plumbing
+(each step's controls are just pins already assigned a role in the entry's
+pin list) rather than introducing a parallel config surface.
+
+- **Clock source**: slaved entirely to the DAW's MIDI Clock/Start/Stop/
+  Continue, received on the device's existing virtual MIDI-in port. There
+  is no internal free-running clock, so a sequence never advances unless
+  the DAW's transport is running. `MidiBridge` intercepts these four
+  realtime message types before they'd otherwise be forwarded to the
+  Arduino (which has no use for them) and routes them to the entry's
+  `SequencerEngine` instead (`app/midi_bridge.py`, `app/sequencer.py`).
+- **Timing**: step advancement is pure tick counting — 24 clock ticks per
+  quarter note (the MIDI standard) — using a configurable ticks-per-step
+  for 8th/16th/32nd/16th-triplet subdivisions. Wall-clock time is only
+  used to smooth an average tick interval, which sizes each triggered
+  step's gate length (fixed 50% of the step duration).
+- **Per-step config** (`config_model.SequencerStepConfig`): a note number
+  plus up to five pin indices borrowed from the entry's existing pin
+  list — a button (enable/disable the step; also its own mute, no
+  separate control), an encoder (live CC while the step plays), a shift
+  button (the encoder's alternate CC, same shift-group mechanism as
+  regular encoders), a PWM pin (mirrors the encoder's current value as a
+  brightness/VU meter), and a step light (flashed for the gate duration
+  while the step plays).
+- **Runtime vs. persisted state**: step count, subdivision, channel,
+  per-step notes, and pin assignments are part of the entry and
+  auto-saved to its JSON file. The on/off pattern and playback position
+  are runtime-only, live on the `SequencerEngine` instance, and are lost
+  on disconnect/app restart — restarting always comes up with every step
+  disabled.
+- **Message flow**: a step's button press arrives from the device like any
+  other pin message; `DeviceSession._on_device_midi` gives the sequencer
+  first look, and only messages it doesn't recognize as a sequencer input
+  are forwarded on to the DAW. A triggered step's Note On/Off goes
+  straight to the DAW via the bridge; step-light and PWM-meter updates go
+  the other direction, straight to the device, using the same synthetic
+  CC messages the firmware already expects for `LIGHT_DIGITAL`/`LIGHT_PWM`
+  pins.
+- **UI**: a dedicated **Sequencer** tab per entry, separate from the
+  Table/Board pin views, showing global settings (step count, subdivision,
+  channel) and one row per step for its note and pin assignments; live
+  step/enabled state streams into the UI while connected and running, and
+  a step can also be toggled from the UI itself as a software fallback
+  when no physical button is wired up.
+
 ## Multi-device support
 
 - Each connected Mega gets its own `SerialLink` + `MidiBridge` session in the
@@ -167,6 +215,7 @@ mad-midi/
     serial_link.py             pyserial connection, background reader, mode transitions
     config_model.py            PinConfig/Preset dataclasses, JSON <-> binary blob (de)serialization
     midi_bridge.py             python-rtmidi virtual port, decode/encode MIDI messages
+    sequencer.py               app-only step sequencer engine, slaved to MIDI clock (see Sequencer below)
     flasher.py                 subprocess wrapper around bundled avrdude
     ui/
       index.html
@@ -188,6 +237,9 @@ mad-midi/
   by device.
 - Dual UI: table view and physical board view over one shared config model,
   with live per-pin state overlay while connected in run mode.
+- App-only step sequencer per device entry, slaved to external MIDI clock,
+  driving pins already assigned in that entry's pin map (see Sequencer
+  above).
 - Unified MIDI monitor: decoded + raw bytes, tagged MIDI vs CTRL.
 - A sidebar of devices (adopted, persistent, offline-editable) and drafts
   (configs not yet tied to hardware, applicable to any adopted device).

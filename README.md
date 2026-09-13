@@ -96,6 +96,29 @@ all connected devices, decoded and in raw hex — useful for checking a pin
 is actually sending what you expect before you go hunting for a wiring
 mistake.
 
+## Sequencer
+
+Each device entry also has a **Sequencer** tab: an app-side step sequencer
+that drives pins on that device, separate from the pin-role mapping in the
+Table/Board views.
+
+- It's slaved entirely to an external MIDI Clock — there's no internal
+  clock, so it stays idle until your DAW sends Start/Stop/Continue and
+  clock ticks. Set the step count, note subdivision (8th/16th/32nd/16th
+  triplets), and MIDI channel for the whole sequence.
+- Each step gets its note plus up to five pin assignments, picked from your
+  device's already-wired pins: a **button** to enable/disable that step
+  (also doubles as its own mute — no separate control), an **encoder** to
+  adjust it live, a **shift** button for the encoder's alternate CC, a
+  **PWM** pin that mirrors the encoder's current value as a brightness/VU
+  meter, and a **step light** that flashes while the step plays.
+- While a device is connected and the DAW's transport is running, the
+  step/enabled state streams back live into the UI so you can see the
+  sequence advance.
+- The on/off pattern and playback position are runtime-only (not saved to
+  a preset or the device's EEPROM) — only the step count, subdivision,
+  channel, notes, and pin assignments are persisted.
+
 ## Rebuilding the firmware (only needed if you edit `firmware/`)
 
 Requires [PlatformIO](https://platformio.org/) (its CLI, not just the
