@@ -81,6 +81,10 @@ bool deserializeConfigBlob(const uint8_t* buffer, uint16_t len) {
   return true;
 }
 
+static bool headerStamped(const uint8_t* buffer) {
+  return buffer[0] == 'M' && buffer[1] == 'M' && buffer[2] == CONFIG_FORMAT_VERSION && buffer[3] == PIN_COUNT;
+}
+
 bool loadConfigFromEEPROM() {
   uint8_t buffer[BLOB_SIZE];
   for (uint16_t i = 0; i < BLOB_SIZE; i++) {
@@ -90,7 +94,12 @@ bool loadConfigFromEEPROM() {
   uint8_t loadedDeviceId;
   if (!parseBlobInto(buffer, BLOB_SIZE, temp, &loadedDeviceId)) {
     loadDefaultConfig();
-    deviceId = 0;
+    // The pin records failed to validate (e.g. no WRITE_CONFIG has ever
+    // happened, just a SET_DEVICE_ID) — but the device id byte isn't
+    // covered by that checksum (see setDeviceId()), so don't throw away a
+    // still-valid id along with the bad pin records. Only reset it to
+    // unassigned when the header itself was never stamped at all.
+    deviceId = headerStamped(buffer) ? buffer[DEVICE_ID_EEPROM_OFFSET] : 0;
     return false;
   }
   memcpy(pinConfigs, temp, sizeof(temp));
@@ -108,6 +117,17 @@ void saveConfigToEEPROM() {
 
 void setDeviceId(uint8_t id) {
   deviceId = id;
+  // Stamp the header (magic/version/pinCount) too, not just the id byte —
+  // loadConfigFromEEPROM() only trusts a stored id when the header is
+  // stamped, so without this a freshly-adopted device (SET_DEVICE_ID with
+  // no WRITE_CONFIG yet) would read back as unassigned on its next boot.
+  EEPROM.update(0, 'M');
+  EEPROM.update(1, 'M');
+  EEPROM.update(2, CONFIG_FORMAT_VERSION);
+  EEPROM.update(3, PIN_COUNT);
   EEPROM.update(DEVICE_ID_EEPROM_OFFSET, id);
-  // checksum is over the pin records only, so it doesn't need recomputing here
+  // checksum (byte 5) is over the pin records only, so it doesn't need
+  // recomputing here — until an actual WRITE_CONFIG, the pin records will
+  // just fail their own checksum check and fall back to defaults, which is
+  // fine (see loadConfigFromEEPROM()).
 }

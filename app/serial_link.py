@@ -14,6 +14,14 @@ import protocol
 
 BAUD_RATE = 115200
 DEFAULT_TIMEOUT_S = 5.0
+RESEND_INTERVAL_S = 0.3
+# Opening the port pulses DTR, auto-resetting the Mega; its bootloader stays
+# in its own listening window for a bit after that and, empirically, ANY
+# byte arriving during that window (not just a recognized one) keeps it
+# holding, delaying handoff to the sketch well past when it'd otherwise be
+# ready -- so the first send has to wait this out in silence rather than
+# retry into it. 1.8s is comfortably past the observed ~1.5s handoff.
+BOOT_SETTLE_S = 1.8
 
 MonitorCallback = Callable[[str, str, bytes], None]  # (direction, kind, raw)
 
@@ -32,6 +40,7 @@ class SerialLink:
         self._frame_parser = protocol.FrameParser()
         self._pending_replies: "queue.Queue" = queue.Queue()
         self._write_lock = threading.Lock()
+        self._connected_at = 0.0
 
     @staticmethod
     def list_ports():
@@ -39,6 +48,7 @@ class SerialLink:
 
     def connect(self, port: str):
         self._ser = serial.Serial(port, BAUD_RATE, timeout=0.05)
+        self._connected_at = time.time()  # see BOOT_SETTLE_S in enter_config_mode()
         self._stop.clear()
         self._mode = "run"
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -70,12 +80,34 @@ class SerialLink:
         self._log("out", "midi", raw_bytes)
 
     def enter_config_mode(self, timeout=DEFAULT_TIMEOUT_S) -> bool:
+        """Sends the enter-config SysEx trigger, resending it every
+        RESEND_INTERVAL_S until acked or `timeout` elapses.
+
+        The very first send is held back until BOOT_SETTLE_S after
+        connect() rather than fired immediately: opening the port pulses
+        DTR and auto-resets the Mega, and empirically, writing anything to
+        it while its bootloader is still in its own listening window keeps
+        it from ever handing off to the sketch — it just sits there mute
+        until the writes stop. So this has to wait that out in silence
+        first, then it's safe to resend on a short interval in case a
+        single send is still somehow missed (harmless once already in
+        config mode — feedConfigFrameByte ignores anything that isn't its
+        own frame-start byte while waiting for one)."""
         if not self.connected:
             return False
-        with self._write_lock:
-            self._ser.write(protocol.SYSEX_ENTER_CONFIG)
-        self._log("out", "ctrl", protocol.SYSEX_ENTER_CONFIG)
-        return self._wait_for_mode("config", timeout)
+        deadline = time.time() + timeout
+        next_send = max(time.time(), self._connected_at + BOOT_SETTLE_S)
+        while time.time() < deadline:
+            if self._mode == "config":
+                return True
+            now = time.time()
+            if now >= next_send:
+                with self._write_lock:
+                    self._ser.write(protocol.SYSEX_ENTER_CONFIG)
+                self._log("out", "ctrl", protocol.SYSEX_ENTER_CONFIG)
+                next_send = now + RESEND_INTERVAL_S
+            time.sleep(0.02)
+        return self._mode == "config"
 
     def resume_run_mode(self, timeout=DEFAULT_TIMEOUT_S) -> bool:
         reply = self._send_config_command(protocol.CMD_RESUME_RUN, b"", timeout)

@@ -172,6 +172,21 @@ button:disabled {
   text-align: left;
 }
 
+.port-picker-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.port-picker-row button:first-child {
+  flex: 1 1 100%;
+}
+
+.port-picker-flash,
+.port-picker-draft {
+  flex: 1;
+}
+
 .port-picker-empty {
   color: var(--text-dim);
   font-size: 11px;

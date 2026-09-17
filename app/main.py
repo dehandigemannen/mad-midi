@@ -5,6 +5,9 @@ multi-device design this implements."""
 
 import json
 import os
+import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
@@ -20,8 +23,20 @@ from sequencer import SequencerEngine
 
 UI_DIR = Path(__file__).parent / "ui"
 
+
+def _log(msg: str):
+    """Temporary diagnostic logging for the flash/reconnect hang investigation
+    — cheap since these are all low-frequency lifecycle events, not anything
+    in a hot loop. Goes to stderr so it's easy to separate from anything
+    else."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
 _OUTPUT_ROLES = ("light_digital", "light_pwm")
 _INPUT_ROLES = ("button_note", "button_cc", "encoder_a", "pot_cc")
+
+AUTO_POLL_INTERVAL_S = 4.0  # how often the background poller checks for known devices coming back online
+AUTO_PROBE_COOLDOWN_S = 10.0  # don't retry a port that just failed to identify more than once per this long
+AUTO_PORT_HINT = "usbmodem"  # macOS-only for now (see README) — Mega's native USB CDC port always matches this
 
 
 def _virtual_port_names(port: str, device_id: int):
@@ -149,7 +164,12 @@ class Api:
         self._window: Optional[webview.Window] = None
         self._devices: Dict[str, DeviceSession] = {}  # port -> session, only while connected
         self._device_ports: Dict[int, str] = {}  # device_id -> port, only while connected
+        self._lock = threading.Lock()  # guards _devices/_device_ports against the auto-reconnect thread
+        self._auto_probe_failed: Dict[str, float] = {}  # port -> time.time() of its last failed identify
+        self._busy_ports: set = set()  # ports mid-flash via flash_firmware()/flash_port(), off-limits to the auto poller
         config_model.migrate_legacy_presets()
+        threading.Thread(target=self._auto_reconnect_loop, daemon=True).start()
+        _log("Api initialized, auto-reconnect poller thread started")
 
     def set_window(self, window):
         self._window = window
@@ -337,22 +357,99 @@ class Api:
         session = DeviceSession(port, self)
         session.identify()
         if session.device_id != entry.device_id:
+            found = session.device_id if session.device_id else "unassigned"
             session.close()
-            return {"ok": False, "error": "the device on that port has a different id"}
+            return {
+                "ok": False,
+                "error": f"the device on that port has a different id (expected {entry.device_id}, found {found})",
+            }
 
-        self._devices[port] = session
-        self._device_ports[entry.device_id] = port
+        with self._lock:
+            self._attach_session(entry, session)
+        return {"ok": True, **self._entry_status(entry)}
+
+    def _attach_session(self, entry: "config_model.Entry", session: "DeviceSession"):
+        """Hooks up an already-identified session (session.device_id ==
+        entry.device_id confirmed by the caller) as the live connection for
+        `entry`. Shared by the manual reconnect_entry() call and the
+        background auto-reconnect poller. Caller holds self._lock."""
+        self._devices[session.port] = session
+        self._device_ports[entry.device_id] = session.port
 
         blob = None
         if session.link.enter_config_mode():
             blob = session.link.read_config()
             session.link.resume_run_mode()
         session.baseline_pins = (
-            config_model.Entry.from_blob(id_, entry.nickname, blob).pins if blob is not None else None
+            config_model.Entry.from_blob(entry.id, entry.nickname, blob).pins if blob is not None else None
         )
         session.active_pins = entry.pins
         session.rebuild_sequencer(entry.sequencer, entry.pins)
-        return {"ok": True, **self._entry_status(entry)}
+
+    # ---- background auto-reconnect --------------------------------------
+    #
+    # Polls for previously-adopted devices coming back online (replugged, or
+    # the app was started after they were already plugged in) and hooks them
+    # up automatically, without the user having to click Connect and pick
+    # the port again. Only ever touches ports that look like an Arduino
+    # (AUTO_PORT_HINT) and only when there's at least one known device
+    # that's currently offline — it never probes when there's nothing to
+    # look for, and it never auto-*adopts* a new/unassigned board (that
+    # still requires an explicit "+ Device" click), since silently handing
+    # out a device id to whatever happens to be plugged in would be a much
+    # bigger surprise than silently reconnecting a board the user already
+    # set up on purpose.
+
+    def _auto_reconnect_tick(self):
+        with self._lock:
+            connected_ports = set(self._devices.keys())
+            busy_ports = set(self._busy_ports)
+            offline_ids = {
+                int(i) for i in config_model.Entry.list_ids()
+                if i.isdigit() and int(i) not in self._device_ports
+            }
+        if not offline_ids:
+            return
+
+        now = time.time()
+        for port in serial_link.SerialLink.list_ports():
+            if AUTO_PORT_HINT not in port:
+                continue
+            if port in connected_ports or port in busy_ports:
+                continue
+            if now - self._auto_probe_failed.get(port, 0) < AUTO_PROBE_COOLDOWN_S:
+                continue
+
+            _log(f"auto-reconnect: probing {port} for offline ids {offline_ids}")
+            try:
+                session = DeviceSession(port, self)
+                session.identify()
+            except Exception as exc:
+                _log(f"auto-reconnect: probe of {port} raised {exc!r}")
+                self._auto_probe_failed[port] = now
+                continue
+
+            if session.device_id and session.device_id in offline_ids:
+                _log(f"auto-reconnect: {port} matched offline device {session.device_id}, attaching")
+                entry = config_model.Entry.load(str(session.device_id))
+                with self._lock:
+                    self._attach_session(entry, session)
+                _log(f"auto-reconnect: device {session.device_id} attached")
+                # no push event needed — the UI already polls list_entries()
+                # on a timer and will pick up the new connected state there
+                offline_ids.discard(session.device_id)
+            else:
+                _log(f"auto-reconnect: {port} did not match (device_id={session.device_id}), cooling down")
+                self._auto_probe_failed[port] = now
+                session.close()
+
+    def _auto_reconnect_loop(self):
+        while True:
+            time.sleep(AUTO_POLL_INTERVAL_S)
+            try:
+                self._auto_reconnect_tick()
+            except Exception:
+                pass  # a background poller must never take the app down
 
     def disconnect_entry(self, id_: str):
         entry = config_model.Entry.load(id_)
@@ -400,15 +497,127 @@ class Api:
     # ---- flashing ----------------------------------------------------
 
     def flash_firmware(self, id_: str):
+        """Flashes the connected device, then reconnects it and writes its
+        current saved config straight back — so it comes back up already
+        playable instead of left on whatever happened to survive in EEPROM.
+
+        avrdude needs exclusive access to the port for its bootloader
+        handshake, and our own SerialLink holding it open blocks that
+        indefinitely (confirmed empirically — avrdude just hangs until its
+        own 60s subprocess timeout), so the port has to be fully released
+        first. self._lock is only held briefly around the dict mutations,
+        NOT across the multi-second avrdude subprocess or the serial
+        round-trips after — holding a lock across seconds of blocking I/O
+        needlessly stalls every other Api call trying to touch device
+        state for that whole window. self._busy_ports covers the same race
+        the long lock hold used to (stopping the auto-reconnect poller from
+        grabbing this port mid-flash) without needing the lock held that
+        long.
+
+        Every step below is wrapped so nothing can escape this method as an
+        uncaught exception: pywebview has nothing to catch it at the JS
+        bridge boundary, and an unhandled exception there can leave the
+        calling JS promise unresolved forever — i.e. the button just looks
+        permanently hung instead of showing an error."""
+        _log(f"flash_firmware({id_}): called")
         entry = config_model.Entry.load(id_)
-        session = self._session_for_device(entry.device_id)
-        if not session:
-            return {"ok": False, "output": "device is not connected"}
+        with self._lock:
+            session = self._session_for_device(entry.device_id)
+            if not session:
+                _log(f"flash_firmware({id_}): no live session, aborting")
+                return {"ok": False, "output": "device is not connected"}
+            port = session.port
+            self._devices.pop(port, None)
+            self._device_ports.pop(entry.device_id, None)
+            self._busy_ports.add(port)
+        _log(f"flash_firmware({id_}): closing existing session on {port}")
+        session.close()
+
         try:
-            output = flasher.flash(session.port)
+            try:
+                _log(f"flash_firmware({id_}): invoking avrdude on {port}")
+                output = flasher.flash(port)
+                _log(f"flash_firmware({id_}): avrdude returned OK")
+            except flasher.FlashError as exc:
+                _log(f"flash_firmware({id_}): avrdude FAILED: {exc}")
+                return {"ok": False, "output": str(exc)}
+
+            try:
+                _log(f"flash_firmware({id_}): reopening {port}")
+                new_session = DeviceSession(port, self)
+                _log(f"flash_firmware({id_}): port reopened, calling identify()")
+                new_session.identify()
+                _log(f"flash_firmware({id_}): identify() returned, device_id={new_session.device_id}")
+            except Exception as exc:
+                _log(f"flash_firmware({id_}): reopen/identify raised {exc!r}")
+                return {
+                    "ok": True,
+                    "output": output,
+                    "reconnect_error": f"flashed, but couldn't reopen the port afterward ({exc}) — reconnect manually",
+                }
+
+            if new_session.device_id != entry.device_id:
+                found = new_session.device_id if new_session.device_id else "unassigned"
+                _log(f"flash_firmware({id_}): id mismatch after flash (expected {entry.device_id}, found {found})")
+                new_session.close()
+                return {
+                    "ok": True,
+                    "output": output,
+                    "reconnect_error": (
+                        f"flashed, but couldn't reconnect afterward "
+                        f"(expected id {entry.device_id}, found {found}) — reconnect manually"
+                    ),
+                }
+
+            with self._lock:
+                self._attach_session(entry, new_session)
+            _log(f"flash_firmware({id_}): reattached, now writing config back")
+
+            try:
+                if new_session.link.enter_config_mode():
+                    _log(f"flash_firmware({id_}): in config mode, sending write_config")
+                    write_ok = new_session.link.write_config(entry.to_blob())
+                    _log(f"flash_firmware({id_}): write_config returned {write_ok}, resuming run mode")
+                    new_session.link.resume_run_mode()
+                    if write_ok:
+                        new_session.baseline_pins = entry.pins
+                        new_session.active_pins = entry.pins
+                else:
+                    _log(f"flash_firmware({id_}): couldn't re-enter config mode to write config")
+            except Exception as exc:
+                _log(f"flash_firmware({id_}): write_config step raised {exc!r}")
+
+            _log(f"flash_firmware({id_}): returning ok")
+            return {"ok": True, "output": output}
+        except Exception as exc:
+            _log(f"flash_firmware({id_}): UNEXPECTED exception: {exc!r}")
+            return {"ok": False, "output": f"unexpected error while flashing: {exc}"}
+        finally:
+            with self._lock:
+                self._busy_ports.discard(port)
+            _log(f"flash_firmware({id_}): busy marker cleared, method exiting")
+
+    def flash_port(self, port: str):
+        """Flash firmware straight to a raw serial port, with no adopted
+        entry or live session required. avrdude drives its own bootloader
+        reset over the port directly, so this works even on a blank board
+        that doesn't yet run firmware speaking our config protocol — the
+        normal adopt_port() path needs that protocol to identify the board,
+        which is exactly what a never-flashed board can't do yet."""
+        with self._lock:
+            if port in self._devices or port in self._busy_ports:
+                return {"ok": False, "output": "port is already connected; disconnect it first"}
+            self._busy_ports.add(port)
+        try:
+            output = flasher.flash(port)
             return {"ok": True, "output": output}
         except flasher.FlashError as exc:
             return {"ok": False, "output": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "output": f"unexpected error while flashing: {exc}"}
+        finally:
+            with self._lock:
+                self._busy_ports.discard(port)
 
     # ---- event plumbing ----------------------------------------------------
 
@@ -438,6 +647,7 @@ def _decode_for_display(kind, raw: bytes):
 
 
 def main():
+    _log("main(): creating Api and window")
     api = Api()
     window = webview.create_window(
         "Mad Midi",
@@ -448,7 +658,9 @@ def main():
         min_size=(900, 600),
     )
     api.set_window(window)
+    _log("main(): window created, starting webview event loop")
     webview.start()
+    _log("main(): webview.start() returned -- window closed")
 
 
 if __name__ == "__main__":

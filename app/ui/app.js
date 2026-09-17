@@ -68,6 +68,7 @@ const SEQ_BASE = {
   encoder_shifted: 16,
   pwm: 24,
   step_light: 32,
+  enabled_light: 40,
 };
 const SEQ_MAX_STEPS = 8;
 const SEQ_FN_LABELS = {
@@ -76,6 +77,7 @@ const SEQ_FN_LABELS = {
   shift: "Shift",
   pwm: "PWM (value)",
   step_light: "Step light",
+  enabled_light: "Enabled light",
 };
 // Functions that need a genuinely PWM-capable pin, vs. functions that
 // should steer clear of them so those pins stay free for PWM use.
@@ -171,6 +173,7 @@ const state = {
   reconnectPorts: [],
   sequencer: null, // {channel, subdivision, steps: [...]} for the selected entry
   sequencerLive: null, // {device_id, running, current_step, step_enabled} pushed from a connected device, or null
+  flashingId: null, // entry id currently mid flash_firmware() call, or null -- keeps the button disabled/labeled through the operation's own disconnect/reconnect
 };
 
 let saveTimer = null;
@@ -260,24 +263,32 @@ function blankSequencerStep(index) {
     shift_pin: null,
     pwm_pin: null,
     step_light_pin: null,
+    enabled_light_pin: null,
   };
 }
 
 // Pins currently eligible for a given step's function: unused, or already
 // holding that exact slot. Encoder additionally needs a free pin+1 (its
 // encoder_b partner), same constraint setPinRole already applies elsewhere.
-// PWM-capable pins are reserved for the "pwm" function and excluded from
-// every other function's dropdown, and vice versa. This is what makes "not
-// enough free pins" a natural block: once nothing is unused, the dropdown
-// simply has nothing else to offer.
+// Only the "pwm" function is pin-restricted — it needs actual PWM hardware,
+// so it's confined to PWM_PINS. Every other function is a plain digital
+// input and works fine on a PWM-capable pin (matches allowedRoles() for the
+// main Table/Board view, which doesn't reserve PWM pins away from buttons
+// either) — so a button/encoder/shift/step_light/enabled_light can freely
+// take one. enabled_light additionally accepts analog pins (like
+// step_light) since a plain on/off lamp works fine there too — see
+// assignSequencerPin, which picks light_pwm vs light_digital based on
+// whichever pin actually gets chosen.
 function sequencerEligiblePins(stepIndex, fn) {
   const step = state.sequencer.steps[stepIndex];
   const currentlyAssigned = step[fn + "_pin"];
   const needsPwm = SEQ_FNS_NEEDING_PWM.has(fn);
-  // step_light can also live on an analog pin (plain digitalWrite works
-  // there); every other function needs a digital pin (button/shift/encoder
-  // for input, pwm for actual PWM hardware, which analog pins don't have).
-  const maxPin = fn === "encoder" ? 53 : fn === "step_light" ? PIN_COUNT : 54;
+  // step_light/enabled_light can also live on an analog pin (plain
+  // digitalWrite works there); every other function needs a digital pin
+  // (button/shift/encoder for input, pwm for actual PWM hardware, which
+  // analog pins don't have).
+  const maxPin =
+    fn === "encoder" ? 53 : fn === "step_light" || fn === "enabled_light" ? PIN_COUNT : 54;
   const result = [];
   for (let pin = 0; pin < maxPin; pin++) {
     if (RESERVED_PINS.has(pin)) continue;
@@ -285,7 +296,7 @@ function sequencerEligiblePins(stepIndex, fn) {
       result.push(pin);
       continue;
     }
-    if (PWM_PINS.has(pin) !== needsPwm) continue;
+    if (needsPwm && !PWM_PINS.has(pin)) continue;
     if (pinByIndex(pin).role !== "unused") continue;
     if (fn === "encoder") {
       if (pin + 1 >= PIN_COUNT || RESERVED_PINS.has(pin + 1)) continue;
@@ -372,6 +383,23 @@ function assignSequencerPin(stepIndex, fn, pin) {
       p.in_max = 127;
       p.out_min = 0;
       p.out_max = 255;
+    } else if (fn === "enabled_light") {
+      // Tracks the step's on/off (enabled) state, not trigger flashes.
+      // Any light-capable pin is allowed: a PWM-capable pin gets driven at
+      // full analog brightness, everything else (including analog A0-A15
+      // pins) gets a plain on/off digital lamp.
+      p.match_cc = true;
+      p.channel = ch;
+      p.number = SEQ_BASE.enabled_light + stepIndex;
+      if (PWM_PINS.has(pin)) {
+        p.role = "light_pwm";
+        p.in_min = 0;
+        p.in_max = 127;
+        p.out_min = 0;
+        p.out_max = 255;
+      } else {
+        p.role = "light_digital";
+      }
     }
   }
 
@@ -402,7 +430,7 @@ function setSequencerChannel(value) {
   // keep every already-assigned sequencer pin's channel (and an active
   // shift group's shifted channel) in sync with the new setting
   state.sequencer.steps.forEach((step) => {
-    ["button", "encoder", "pwm", "step_light"].forEach((fn) => {
+    ["button", "encoder", "pwm", "step_light", "enabled_light"].forEach((fn) => {
       const pin = step[fn + "_pin"];
       if (pin !== null && pin !== undefined) pinByIndex(pin).channel = value;
     });
@@ -1027,6 +1055,7 @@ function renderSequencerSteps() {
     row.appendChild(buildSequencerPinSelect(i, "shift", step.shift_pin));
     row.appendChild(buildSequencerPinSelect(i, "pwm", step.pwm_pin));
     row.appendChild(buildSequencerPinSelect(i, "step_light", step.step_light_pin));
+    row.appendChild(buildSequencerPinSelect(i, "enabled_light", step.enabled_light_pin));
     row.appendChild(buildEncoderShiftLinkHint(step));
 
     container.appendChild(row);
@@ -1138,7 +1167,7 @@ function renderSidebar() {
   renderAddDevicePicker();
 }
 
-function buildPortPicker(ports, onPick) {
+function buildPortPicker(ports, onPick, opts = {}) {
   const wrap = document.createElement("div");
   wrap.className = "port-picker";
   if (ports.length === 0) {
@@ -1149,10 +1178,36 @@ function buildPortPicker(ports, onPick) {
     return wrap;
   }
   ports.forEach((port) => {
+    const row = document.createElement("div");
+    row.className = "port-picker-row";
     const btn = document.createElement("button");
     btn.textContent = port;
     btn.addEventListener("click", () => onPick(port));
-    wrap.appendChild(btn);
+    row.appendChild(btn);
+    if (opts.withFlash) {
+      const flashBtn = document.createElement("button");
+      flashBtn.className = "port-picker-flash";
+      flashBtn.textContent = "Flash";
+      flashBtn.title =
+        "Flash firmware directly to this port — use this first if the port doesn't adopt (blank or unresponsive board)";
+      flashBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        flashPort(port);
+      });
+      row.appendChild(flashBtn);
+
+      const draftBtn = document.createElement("button");
+      draftBtn.className = "port-picker-draft";
+      draftBtn.textContent = "New draft";
+      draftBtn.title =
+        "Start a draft pin map for this board now, without needing it to respond yet";
+      draftBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        draftFromPort(port);
+      });
+      row.appendChild(draftBtn);
+    }
+    wrap.appendChild(row);
   });
   return wrap;
 }
@@ -1162,7 +1217,17 @@ function renderAddDevicePicker() {
   container.innerHTML = "";
   container.hidden = state.addDevicePorts === null;
   if (state.addDevicePorts === null) return;
-  container.appendChild(buildPortPicker(state.addDevicePorts, adoptPort));
+  container.appendChild(buildPortPicker(state.addDevicePorts, adoptPort, { withFlash: true }));
+}
+
+async function flashPort(port) {
+  if (!confirm(`Flash firmware to ${port}? This takes a few seconds.`)) return;
+  const result = await api("flash_port", port);
+  alert(
+    result.ok
+      ? "Flash succeeded. Click the port again to adopt it."
+      : "Flash failed:\n\n" + result.output
+  );
 }
 
 async function toggleAddDevicePicker() {
@@ -1178,15 +1243,28 @@ async function adoptPort(port) {
   state.addDevicePorts = null;
   const entry = await api("adopt_port", port);
   await refreshEntries();
-  if (entry) await selectEntry(entry.id);
+  if (entry) {
+    await selectEntry(entry.id);
+  } else {
+    alert(
+      `${port} didn't respond as a Mad Midi device — it's probably running a ` +
+        `different sketch (or none at all). Use "Flash" to put the firmware on it ` +
+        `first, or "New draft" to start configuring its pin map now and adopt it later.`
+    );
+  }
 }
 
-async function createDraft() {
-  const name = prompt("Draft name:", "Untitled draft");
+async function createDraft(defaultName = "Untitled draft") {
+  const name = prompt("Draft name:", defaultName);
   if (name === null) return;
   const entry = await api("create_draft", name);
   await refreshEntries();
   await selectEntry(entry.id);
+}
+
+async function draftFromPort(port) {
+  const base = port.split("/").pop();
+  await createDraft(`Draft (${base})`);
 }
 
 async function renameEntry(id, currentName) {
@@ -1271,9 +1349,10 @@ function renderHeader() {
     writeBtn.addEventListener("click", writeToDevice);
     el.appendChild(writeBtn);
 
+    const flashing = state.flashingId === entry.id;
     const flashBtn = document.createElement("button");
-    flashBtn.textContent = "Flash firmware";
-    flashBtn.disabled = !entry.connected;
+    flashBtn.textContent = flashing ? "Flashing…" : "Flash firmware";
+    flashBtn.disabled = flashing || !entry.connected;
     flashBtn.addEventListener("click", flashFirmware);
     el.appendChild(flashBtn);
   } else {
@@ -1356,9 +1435,29 @@ async function writeToDevice() {
 
 async function flashFirmware() {
   const id = state.selectedId;
-  if (!confirm("Flash firmware to this device? This takes a few seconds.")) return;
-  const result = await api("flash_firmware", id);
-  alert(result.ok ? "Flash succeeded." : "Flash failed:\n\n" + result.output);
+  if (state.flashingId) return; // already mid-flash somewhere -- ignore a stray double-click
+  if (
+    !confirm(
+      "Flash firmware to this device, then reconnect it and write its current config back? This takes a few seconds."
+    )
+  )
+    return;
+  state.flashingId = id;
+  renderAll();
+  try {
+    const result = await api("flash_firmware", id);
+    await refreshEntries();
+    if (!result.ok) {
+      alert("Flash failed:\n\n" + result.output);
+    } else if (result.reconnect_error) {
+      alert("Flash succeeded, but " + result.reconnect_error + ".");
+    } else {
+      alert("Flash succeeded — config written to the device.");
+    }
+  } finally {
+    state.flashingId = null;
+    renderAll();
+  }
 }
 
 // ---- monitor ---------------------------------------------------------------

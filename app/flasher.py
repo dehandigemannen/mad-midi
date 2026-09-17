@@ -43,7 +43,18 @@ def flash(port: str, hex_path: Path = FIRMWARE_HEX) -> str:
         "-D",
         "-U", f"flash:w:{hex_path}:i",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        # avrdude can genuinely stall (e.g. the port wasn't actually free) --
+        # surface that as a normal FlashError rather than letting
+        # TimeoutExpired escape uncaught. An unhandled exception here would
+        # propagate through the pywebview JS bridge with nothing to catch
+        # it, which can leave the calling JS promise unresolved forever --
+        # i.e. the app just sits there looking hung instead of reporting
+        # a failure.
+        partial = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        raise FlashError(f"avrdude timed out after 60s (port may not have been free):\n{partial}")
     if result.returncode != 0:
         raise FlashError(result.stdout + result.stderr)
     return result.stdout + result.stderr

@@ -89,13 +89,18 @@ class SequencerStepConfig:
     hardware, not driven by this app — and it doubles as the step's on/off
     control (no separate mute). Note/velocity never change dynamically once
     triggered. pwm_pin mirrors the encoder's live CC output as PWM brightness
-    (a value meter, not an enabled/disabled indicator)."""
+    (a value meter, not an enabled/disabled indicator). enabled_light_pin is a
+    separate lamp that tracks the step's on/off (enabled/disabled) state
+    rather than flashing on trigger like step_light_pin — it may be assigned
+    to either a plain digital pin (on/off) or a PWM-capable pin (driven at
+    full brightness), unlike step_light_pin which is digital-only."""
     note: int = 60
     button_pin: Optional[int] = None
     encoder_pin: Optional[int] = None  # encoder_a pin index; pin+1 is encoder_b
     shift_pin: Optional[int] = None
     pwm_pin: Optional[int] = None
     step_light_pin: Optional[int] = None
+    enabled_light_pin: Optional[int] = None
 
     def to_dict(self):
         return dataclasses.asdict(self)

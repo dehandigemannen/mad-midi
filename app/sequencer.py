@@ -10,9 +10,11 @@ not persisted — see config_model.SequencerConfig's docstring.
 
 Drives its own step lights and notes by reusing the app's existing MIDI
 paths verbatim: a light pin is flashed with the same kind of synthetic
-CC/Note the firmware already treats as "light_digital" input (normally sent
-by a DAW), and a triggered step's note is forwarded to the DAW exactly like
-any other device-originated MIDI message.
+CC/Note the firmware already treats as "light_digital"/"light_pwm" input
+(normally sent by a DAW), and a triggered step's note is forwarded to the
+DAW exactly like any other device-originated MIDI message. Each step's
+enabled_light pin is driven the same way, but tracks the step's on/off
+state rather than flashing on trigger.
 """
 
 import threading
@@ -33,6 +35,8 @@ DEFAULT_TICKS_PER_STEP = SUBDIVISION_TICKS["16th"]
 GATE_FRACTION = 0.5  # Note On lasts this fraction of one step's duration
 DEFAULT_VELOCITY = 100
 FALLBACK_TICK_INTERVAL_S = 60.0 / 120 / TICKS_PER_QUARTER  # seed at ~120bpm until clock arrives
+PWM_METER_START = 64  # start each meter at mid-brightness so both turn directions are visible right away
+PWM_METER_STEP = 3  # brightness change per detent -- ~a third of a full turn (42 clicks) sweeps 0-127
 
 SendBytes = Callable[[bytes], None]
 StateCallback = Callable[[dict], None]
@@ -47,6 +51,7 @@ class _ResolvedStep:
         self.button = _resolve(pins, step.button_pin)
         self.step_light = _resolve(pins, step.step_light_pin)
         self.pwm = _resolve(pins, step.pwm_pin)
+        self.enabled_light = _resolve(pins, step.enabled_light_pin)
 
         # The PWM meter mirrors whichever CC the encoder is currently
         # sending — plain or, if a shift group is configured, shifted too.
@@ -91,6 +96,17 @@ class SequencerEngine:
         self._avg_tick_interval = FALLBACK_TICK_INTERVAL_S
         self._off_timers: List[Optional[threading.Timer]] = [None] * len(self._steps)
         self._lock = threading.Lock()
+
+        # The encoder only ever reports a relative click (CC 1 = one step
+        # CW, 127 = one step CCW) -- there's no such thing as "its current
+        # absolute value" to read back, from the device or from a DAW (a
+        # generic MIDI-mapped CC in a DAW is one-way; getting real value
+        # feedback would mean writing a DAW-specific control-surface
+        # integration). So the pwm meter's brightness is our own running
+        # position, accumulated click-by-click here rather than mirroring
+        # the raw relative value directly (which would barely light up on
+        # a CW click and nearly max out on a single CCW one).
+        self._pwm_value = [PWM_METER_START] * len(self._steps)
 
     # ---- transport -----------------------------------------------------
 
@@ -179,7 +195,13 @@ class SequencerEngine:
                 self.set_step_enabled(index, value != 0)
                 return True
             if step.pwm is not None and (step.encoder_plain == (channel, number) or step.encoder_shifted == (channel, number)):
-                self._send_cc(step.pwm, value)
+                # value is a relative click (1 = CW, 127 = CCW, see
+                # ENCODER_A in firmware/src/roles.cpp), not an absolute
+                # position -- accumulate it into one here instead of
+                # forwarding it as-is.
+                delta = PWM_METER_STEP if value == 1 else -PWM_METER_STEP
+                self._pwm_value[index] = max(0, min(127, self._pwm_value[index] + delta))
+                self._send_cc(step.pwm, self._pwm_value[index])
         return False
 
     def set_step_enabled(self, index: int, enabled: bool) -> None:
@@ -187,6 +209,7 @@ class SequencerEngine:
             return
         with self._lock:
             self.step_enabled[index] = enabled
+        self._send_cc(self._steps[index].enabled_light, 127 if enabled else 0)
         self._emit_state()
 
     # ---- state ------------------------------------------------------------
