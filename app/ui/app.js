@@ -1543,7 +1543,7 @@ function renderAll() {
 
 function initEventListeners() {
   document.getElementById("addDeviceBtn").addEventListener("click", toggleAddDevicePicker);
-  document.getElementById("addDraftBtn").addEventListener("click", createDraft);
+  document.getElementById("addDraftBtn").addEventListener("click", () => createDraft());
 
   document.getElementById("clearMonitorBtn").addEventListener("click", () => {
     document.getElementById("monitorLog").innerHTML = "";
