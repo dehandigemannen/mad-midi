@@ -31,6 +31,7 @@ class PinConfig:
     invert: bool = False
     toggle: bool = False
     match_cc: bool = False  # light_digital/light_pwm only: match a CC instead of a Note
+    accel: bool = True  # encoder_a only: scale relative CC step size with turn speed
 
     @property
     def reserved(self) -> bool:
@@ -41,6 +42,7 @@ class PinConfig:
             (protocol.FLAG_INVERT if self.invert else 0)
             | (protocol.FLAG_TOGGLE if self.toggle else 0)
             | (protocol.FLAG_MATCH_CC if self.match_cc else 0)
+            | (protocol.FLAG_ACCEL_ENABLE if self.accel else 0)
         )
         role_val = protocol.ROLE_BY_NAME.get(self.role, protocol.ROLE_UNUSED)
         return (
@@ -64,6 +66,7 @@ class PinConfig:
             invert=bool(flags & protocol.FLAG_INVERT),
             toggle=bool(flags & protocol.FLAG_TOGGLE),
             match_cc=bool(flags & protocol.FLAG_MATCH_CC),
+            accel=bool(flags & protocol.FLAG_ACCEL_ENABLE),
         )
 
     def to_dict(self):

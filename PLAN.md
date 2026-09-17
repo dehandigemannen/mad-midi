@@ -61,7 +61,7 @@ Reply convention: success = request CMD `| 0x80`, error = request CMD `| 0xC0`.
 ```
 Header (6 bytes):
   [0-1] magic = 'M','M'
-  [2]   config format version (currently 3)
+  [2]   config format version (currently 4)
   [3]   pin count (70)
   [4]   device id (0 = unassigned; set once via SET_DEVICE_ID, persists across reconnects/ports)
   [5]   checksum (sum of all record bytes, mod 256 — does NOT cover the device id byte,
@@ -92,7 +92,7 @@ Records: 70 x 8 bytes, indexed by Arduino Mega pin number directly
 | 2 | BUTTON_CC | digital-in -> MIDI out | momentary or toggle CC (flags bit1) |
 | 3 | LIGHT_DIGITAL | MIDI in -> digital out | on/off from an incoming Note or CC (which one is chosen by flags bit2, `FLAG_MATCH_CC`) |
 | 4 | LIGHT_PWM | MIDI in -> PWM out | `analogWrite(map(value, inMin,inMax, outMin,outMax))` — also used for VU meters (single-pin analog needle); Note vs CC selected the same way as LIGHT_DIGITAL |
-| 5 | ENCODER_A | digital-in pair -> MIDI out | quadrature phase A; paired with the next pin (ENCODER_B). Fixed 1:1, relative CC: value `1` = +1 step (CW), value `127` = -1 step (CCW). Fields are repurposed for shift support (see below) |
+| 5 | ENCODER_A | digital-in pair -> MIDI out | quadrature phase A; paired with the next pin (ENCODER_B). Relative CC: value `1` = +1 step (CW), value `127` = -1 step (CCW) per detent. With `FLAG_ACCEL_ENABLE` (flags bit3) set, the step magnitude scales with turn speed instead of staying fixed at 1 (see Encoder acceleration below). Fields are repurposed for shift support (see below) |
 | 6 | ENCODER_B | — | marks the pin as consumed by the preceding ENCODER_A |
 | 7 | POT_CC | analog-in -> MIDI out | raw ADC (0-1023, stored as inMin/inMax >>2) scaled to CC 0-127 |
 | 8 | BUTTON_SHIFT | digital-in, modifier only | pure modifier: sends no MIDI of its own; while held, any ENCODER_A pin whose `inMin` names this pin's index switches to its shifted channel/CC |
@@ -112,8 +112,34 @@ specific button, not a device-wide modifier):
 | `outMax` | shifted-state MIDI CC number |
 
 While the referenced shift button is held, a turn sends relative CC on
-`(outMin, outMax)` instead of `(channel, number)` — same 1/127 encoding
-either way.
+`(outMin, outMax)` instead of `(channel, number)` — same encoding either way
+(including acceleration, if enabled).
+
+#### Encoder acceleration (ENCODER_A only)
+
+Opt-in per encoder via `FLAG_ACCEL_ENABLE` (flags bit3), default on for newly
+created pins in the app; existing devices keep the old fixed-1 behavior until
+their config is re-saved and re-flashed, since the bit is unset on already-
+written EEPROM blobs. When enabled, the relative CC value sent per detent
+scales with how fast the encoder is turned, instead of always being `1`/`127`
+— useful for parameters mapped over a wide range (e.g. a filter cutoff from
+30Hz to 20kHz), which otherwise take up to 127 physical detents to sweep
+since Ableton spreads the mapped range evenly over the 7-bit relative CC
+range.
+
+The acceleration curve is ported as-is from the ClickEncoder library
+(0xPIT/encoder), whose constants happen to already be tuned for a ~1ms
+service tick — the same cadence `roles.cpp`'s quadrature ISR runs at:
+- a per-encoder counter decays by 2 every ISR tick (~1ms)
+- bumped by 25 on each confirmed step
+- capped at 3072
+- turned into a step multiplier via `counter >> 8` (0-12) when a pending
+  step is drained, so the sent value is `1 + multiplier`, capped at 63 (the
+  ceiling of the two's-complement relative CC encoding)
+
+These are fixed firmware constants, not app-configurable — tune by editing
+`ENC_ACCEL_TOP` / `ENC_ACCEL_INC` / `ENC_ACCEL_DEC` in `roles.cpp` and
+reflashing.
 
 ## Sequencer
 
@@ -249,9 +275,10 @@ mad-midi/
 - macOS only. Run from source (`python app/main.py` in a venv) — no .app
   packaging yet.
 
-Out of scope for v1 (explicitly deferred): encoder push-buttons, encoder
-acceleration, real DIN MIDI hardware output, Windows/Linux support,
-distributable `.app` packaging, encoder velocity/curve options beyond linear.
+Out of scope for v1 (explicitly deferred): encoder push-buttons, real DIN
+MIDI hardware output, Windows/Linux support, distributable `.app` packaging,
+app-configurable encoder acceleration curves (the shipped curve is a fixed
+firmware constant — see Encoder acceleration above).
 
 ## Build / run
 

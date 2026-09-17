@@ -42,7 +42,7 @@ const ROLE_FIELDS = {
     "out_max",
     "invert",
   ],
-  encoder_a: ["channel", "number"], // shift fields are rendered separately, see renderEditor
+  encoder_a: ["channel", "number", "accel"], // shift fields are rendered separately, see renderEditor
   encoder_b: [],
   pot_cc: [
     "channel",
@@ -97,6 +97,7 @@ const FIELD_META = {
   out_max: { label: "Out max", type: "number", min: 0, max: 255 },
   invert: { label: "Invert", type: "checkbox" },
   toggle: { label: "Toggle (vs momentary)", type: "checkbox" },
+  accel: { label: "Acceleration (faster turns = bigger steps)", type: "checkbox" },
 };
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -684,7 +685,7 @@ function renderEditor() {
   if (p.role === "encoder_a") {
     const hint = document.createElement("div");
     hint.className = "field-hint";
-    hint.textContent = `Uses this pin + pin ${pin + 1} (A/B quadrature). Fixed 1:1, relative CC (1=CW, 127=CCW).`;
+    hint.textContent = `Uses this pin + pin ${pin + 1} (A/B quadrature). Relative CC (1=CW, 127=CCW per step); with Acceleration on, fast turns send a bigger step value instead of just 1/127.`;
     fields.appendChild(hint);
   }
   if (p.role === "button_shift") {

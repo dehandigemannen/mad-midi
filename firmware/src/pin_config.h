@@ -2,7 +2,7 @@
 #include <Arduino.h>
 
 static const uint8_t PIN_COUNT = 70; // Mega: 0-53 digital, 54-69 = A0-A15
-static const uint8_t CONFIG_FORMAT_VERSION = 3; // bumped: header gained deviceId, encoder fields reinterpreted for shift, FLAG_MATCH_CC added
+static const uint8_t CONFIG_FORMAT_VERSION = 4; // bumped: FLAG_ACCEL_ENABLE added
 
 enum PinRole : uint8_t {
   ROLE_UNUSED = 0,
@@ -23,6 +23,9 @@ enum PinFlags : uint8_t {
   // Without this a light would ambiguously match either a Note or a CC with
   // the same number.
   FLAG_MATCH_CC = 1 << 2,
+  // ENCODER_A only: scale relative CC step size up the faster the encoder is
+  // turned (see roles.cpp). Unset = fixed 1/127 per detent, unchanged.
+  FLAG_ACCEL_ENABLE = 1 << 3,
 };
 
 // For ROLE_ENCODER_A, inMin/inMax/outMin/outMax are repurposed (encoders

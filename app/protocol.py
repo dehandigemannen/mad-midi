@@ -6,7 +6,7 @@ no code generation between the two right now.
 import struct
 
 PIN_COUNT = 70  # Mega: 0-53 digital, 54-69 = A0-A15
-CONFIG_FORMAT_VERSION = 3  # bumped: header gained device_id, encoder fields reinterpreted for shift, FLAG_MATCH_CC added
+CONFIG_FORMAT_VERSION = 4  # bumped: FLAG_ACCEL_ENABLE added
 RECORD_SIZE = 8
 HEADER_SIZE = 6  # magic(2) + version(1) + pinCount(1) + deviceId(1) + checksum(1)
 BLOB_SIZE = HEADER_SIZE + PIN_COUNT * RECORD_SIZE
@@ -43,6 +43,8 @@ FLAG_INVERT = 1 << 0
 FLAG_TOGGLE = 1 << 1
 # LIGHT_DIGITAL/LIGHT_PWM only: unset = number is a Note, set = number is a CC.
 FLAG_MATCH_CC = 1 << 2
+# ENCODER_A only: scale relative CC step size up the faster the encoder is turned.
+FLAG_ACCEL_ENABLE = 1 << 3
 
 # --- SysEx mode-switch trigger/ack (0x7D = MIDI-reserved non-commercial ID) -
 

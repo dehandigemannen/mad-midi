@@ -14,6 +14,19 @@ static int16_t potLastSent[PIN_COUNT];
 static volatile int8_t encoderAccum[PIN_COUNT];
 static volatile uint8_t encoderPrevState[PIN_COUNT];
 
+// Per-encoder acceleration state for FLAG_ACCEL_ENABLE, ported from the
+// well-established ClickEncoder library's algorithm (0xPIT/encoder), whose
+// constants were already tuned for a ~1ms service tick -- the same cadence
+// TIMER1_COMPC_vect runs at here, so they're reused as-is rather than
+// re-derived: decays by ENC_ACCEL_DEC every tick, bumped by ENC_ACCEL_INC on
+// each confirmed step, capped at ENC_ACCEL_TOP. scanButtonsAndEncoders()
+// turns the current value into a step multiplier via >>8 (0-12) when it
+// drains a pending step.
+static volatile uint16_t encoderAccel[PIN_COUNT];
+static const uint16_t ENC_ACCEL_TOP = 3072;
+static const uint16_t ENC_ACCEL_INC = 25;
+static const uint16_t ENC_ACCEL_DEC = 2;
+
 // Steps accumulated by ISR(TIMER1_COMPC_vect) below since the main loop last
 // drained them: positive = CW steps pending, negative = CCW. Written only by
 // the ISR, read-and-cleared only by scanButtonsAndEncoders().
@@ -59,6 +72,16 @@ static const int8_t QUAD_TABLE[16] = {
 // missed/sluggish encoder turns, worse the more pots/buttons a board has
 // configured. A steady hardware-timed tick decouples sampling from loop()
 // timing entirely.
+// Bumps a pin's acceleration counter on a confirmed step, capped at
+// ENC_ACCEL_TOP. Called from the ISR below; kept as a tiny helper since both
+// step directions need it.
+static inline void bumpAccel(uint8_t pin)
+{
+  uint16_t accel = encoderAccel[pin];
+  accel = (accel <= ENC_ACCEL_TOP - ENC_ACCEL_INC) ? (uint16_t)(accel + ENC_ACCEL_INC) : ENC_ACCEL_TOP;
+  encoderAccel[pin] = accel;
+}
+
 ISR(TIMER1_COMPC_vect)
 {
   for (uint8_t i = 0; i < encoderIsrCount; i++)
@@ -70,6 +93,12 @@ ISR(TIMER1_COMPC_vect)
     uint8_t idx = (uint8_t)((encoderPrevState[slot.pin] << 2) | state) & 0x0F;
     int8_t movement = QUAD_TABLE[idx];
     encoderPrevState[slot.pin] = state;
+
+    // Decay every tick regardless of movement, so acceleration falls back to
+    // 0 shortly after the encoder slows down or stops.
+    uint16_t accel = encoderAccel[slot.pin];
+    encoderAccel[slot.pin] = (accel > ENC_ACCEL_DEC) ? (uint16_t)(accel - ENC_ACCEL_DEC) : 0;
+
     if (movement == 0)
       continue;
 
@@ -79,12 +108,14 @@ ISR(TIMER1_COMPC_vect)
       accum = 0;
       if (encoderPending[slot.pin] < 120)
         encoderPending[slot.pin]++;
+      bumpAccel(slot.pin);
     }
     else if (accum <= -4)
     {
       accum = 0;
       if (encoderPending[slot.pin] > -120)
         encoderPending[slot.pin]--;
+      bumpAccel(slot.pin);
     }
     encoderAccum[slot.pin] = accum;
   }
@@ -145,6 +176,7 @@ void rolesInit()
     encoderAccum[i] = 0;
     encoderPrevState[i] = 0;
     encoderPending[i] = 0;
+    encoderAccel[i] = 0;
   }
   encoderIsrCount = 0;
   for (uint8_t pin = 0; pin + 1 < PIN_COUNT; pin++)
@@ -270,6 +302,7 @@ static void scanButtonsAndEncoders()
       noInterrupts();
       int8_t pending = encoderPending[pin];
       encoderPending[pin] = 0;
+      uint16_t accel = encoderAccel[pin];
       interrupts();
       if (pending == 0)
         continue;
@@ -278,9 +311,20 @@ static void scanButtonsAndEncoders()
       bool shifted = isShiftPinActive(c.inMin);
       uint8_t sendChannel = shifted ? c.outMin : c.channel;
       uint8_t sendNumber = shifted ? c.outMax : c.number;
+
+      // Step magnitude: 1 unless FLAG_ACCEL_ENABLE is set, in which case it
+      // scales with how fast the encoder is being turned (see encoderAccel /
+      // ENC_ACCEL_* above). Capped well under 63 so it always stays a valid
+      // positive two's-complement relative CC value.
+      uint16_t multiplier = (c.flags & FLAG_ACCEL_ENABLE) ? (accel >> 8) : 0;
+      uint8_t magnitude = (uint8_t)(1 + multiplier);
+      if (magnitude > 63)
+        magnitude = 63;
+      uint8_t ccValue = pending > 0 ? magnitude : (uint8_t)(128 - magnitude);
+
       uint8_t steps = pending > 0 ? (uint8_t)pending : (uint8_t)(-pending);
       for (uint8_t i = 0; i < steps; i++)
-        midiSendCC(sendChannel, sendNumber, pending > 0 ? 1 : 127);
+        midiSendCC(sendChannel, sendNumber, ccValue);
     }
   }
 }
