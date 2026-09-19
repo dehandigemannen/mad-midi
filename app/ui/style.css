@@ -558,13 +558,17 @@ button:disabled {
   margin-bottom: 0;
 }
 
-#sequencerSteps {
+#sequencerSteps,
+#droneSegments,
+#fxRackSegments {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.sequencer-step {
+/* ---- segment cards (sequencer steps, drone/fx segments) ---- */
+
+.segment-card {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
@@ -576,29 +580,89 @@ button:disabled {
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.sequencer-step .field-row {
+.segment-card .field-row {
   margin-bottom: 0;
   min-width: 130px;
 }
 
-.sequencer-step .field-hint {
+.segment-card .field-hint {
   margin: 0;
 }
 
-.sequencer-step-heading {
+.segment-card-heading {
   font-weight: 600;
   font-size: 12px;
   flex-basis: 60px;
   flex-shrink: 0;
 }
 
-.sequencer-step.playhead {
+.segment-card.playhead {
   border-color: var(--accent);
   box-shadow: 0 0 8px var(--accent);
+}
+
+.segment-card.active {
+  border-color: var(--good);
+  box-shadow: 0 0 8px var(--good);
 }
 
 .sequencer-link-hint {
   flex-basis: 100%;
   margin: 0;
   color: var(--text-dim);
+}
+
+/* ---- feature toggles (header) ---- */
+
+.feature-toggles {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.feature-toggle {
+  width: auto;
+  gap: 4px;
+}
+
+/* ---- joystick view ---- */
+
+.joystick-monitor {
+  position: relative;
+  width: 160px;
+  height: 160px;
+  margin: 14px 0;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.joystick-dot {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  margin-top: -6px;
+  left: 50%;
+  top: 50%;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  transition: left 0.05s linear, top 0.05s linear;
+}
+
+.joystick-zbar-wrap {
+  width: 160px;
+  height: 10px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.joystick-zbar-fill {
+  height: 100%;
+  width: 50%;
+  background: var(--accent);
+  transition: width 0.05s linear;
 }

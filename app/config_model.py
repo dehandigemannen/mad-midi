@@ -38,6 +38,13 @@ class PinConfig:
     # light_digital/light_pwm only: mirror this button/shift pin's live state
     # directly instead of matching an incoming Note/CC. NO_SHIFT_PIN = off.
     listen_pin: int = protocol.NO_SHIFT_PIN
+    # encoder_a/pot_cc only: index of a light_pwm pin whose brightness should
+    # track this control's live value (a VU meter). App-only bookkeeping --
+    # deliberately excluded from to_tuple()/from_tuple(), since the firmware
+    # has no idea this is happening (it's driven the same way a sequencer
+    # step's PWM meter always was: a synthetic CC sent to the target pin's
+    # own configured channel/number). NO_SHIFT_PIN = off. See value_mirror.py.
+    mirror_pin: int = protocol.NO_SHIFT_PIN
 
     @property
     def reserved(self) -> bool:
@@ -91,7 +98,10 @@ class PinConfig:
 
     @staticmethod
     def equal(a: "PinConfig", b: "PinConfig") -> bool:
-        return dataclasses.astuple(a) == dataclasses.astuple(b)
+        # Compare only blob-relevant fields (to_tuple()), not the full
+        # dataclass — app-only bookkeeping fields (e.g. mirror_pin) never
+        # reach the EEPROM blob and must not affect the "in sync" check.
+        return a.to_tuple() == b.to_tuple()
 
 
 DEFAULT_STEP_COUNT = 4
@@ -111,8 +121,9 @@ class SequencerStepConfig:
     to either a plain digital pin (on/off) or a PWM-capable pin (driven at
     full brightness), unlike step_light_pin which is digital-only."""
     note: int = 60
+    control_type: str = "encoder"  # "encoder" | "pot" -- which role this step's own value control uses
     button_pin: Optional[int] = None
-    encoder_pin: Optional[int] = None  # encoder_a pin index; pin+1 is encoder_b
+    encoder_pin: Optional[int] = None  # encoder_a pin index (pin+1 is encoder_b) if control_type == "encoder", else a pot_cc pin index
     shift_pin: Optional[int] = None
     pwm_pin: Optional[int] = None
     step_light_pin: Optional[int] = None
@@ -138,7 +149,6 @@ class SequencerConfig:
     channel: int = 0
     subdivision: str = "16th"  # "8th" | "16th" | "32nd" | "16th_triplet"
     enabled: bool = True  # off = DeviceSession never builds a SequencerEngine for this entry
-    step_control: str = "encoder"  # "encoder" | "pot" -- which role each step's value control uses
     steps: List[SequencerStepConfig] = dataclasses.field(
         default_factory=lambda: _default_steps(DEFAULT_STEP_COUNT)
     )
@@ -148,7 +158,6 @@ class SequencerConfig:
             "channel": self.channel,
             "subdivision": self.subdivision,
             "enabled": self.enabled,
-            "step_control": self.step_control,
             "steps": [s.to_dict() for s in self.steps],
         }
 
@@ -159,7 +168,6 @@ class SequencerConfig:
             channel=d.get("channel", 0),
             subdivision=d.get("subdivision", "16th"),
             enabled=d.get("enabled", True),
-            step_control=d.get("step_control", "encoder"),
             steps=steps or _default_steps(DEFAULT_STEP_COUNT),
         )
 
@@ -170,6 +178,131 @@ def _default_steps(count: int) -> List[SequencerStepConfig]:
     return [SequencerStepConfig(note=60 + i) for i in range(count)]
 
 
+DRONE_MAX_SEGMENTS = 8
+
+
+@dataclasses.dataclass
+class DroneSegmentConfig:
+    """One drone's physical control cluster. A drone never sends a Note --
+    only its value control's ordinary CC output, which reaches the DAW only
+    while the drone is enabled (see gated_segments.GatedSegmentEngine). The
+    on/shift lights need no engine support at all: they're wired via
+    PinConfig.listen_pin directly at the enable_pin/shift_pin (firmware
+    mirrors a toggle button's logical on/off state, not just its raw
+    press/release edges -- see roles.cpp's applyListenLights())."""
+    control_type: str = "encoder"  # "encoder" | "pot" -- which role this segment's own value control uses
+    control_pin: Optional[int] = None      # encoder_a or pot_cc: the value control
+    enable_pin: Optional[int] = None       # button_cc+toggle; gates control_pin's CC to the DAW
+    shift_pin: Optional[int] = None        # button_shift
+    pwm_pin: Optional[int] = None          # light_pwm; sets control_pin.mirror_pin (see value_mirror.py)
+    on_light_pin: Optional[int] = None     # light_digital/pwm, listen_pin -> enable_pin
+    shift_light_pin: Optional[int] = None  # light_digital/pwm, listen_pin -> shift_pin
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_dict(d) -> "DroneSegmentConfig":
+        return DroneSegmentConfig(**{k: v for k, v in d.items() if k in DroneSegmentConfig.__dataclass_fields__})
+
+
+@dataclasses.dataclass
+class DroneConfig:
+    """App-only drone config for an Entry, same treatment as SequencerConfig:
+    not part of the EEPROM blob, and a drone segment's live enabled state
+    (see gated_segments.GatedSegmentEngine.enabled) lives in memory only on
+    the DeviceSession's DroneEngine, not here."""
+    enabled: bool = False  # off = DeviceSession never builds a DroneEngine for this entry
+    channel: int = 0  # shared MIDI channel for every segment's control/enable pins
+    segments: List[DroneSegmentConfig] = dataclasses.field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "enabled": self.enabled,
+            "channel": self.channel,
+            "segments": [s.to_dict() for s in self.segments],
+        }
+
+    @staticmethod
+    def from_dict(d) -> "DroneConfig":
+        return DroneConfig(
+            enabled=d.get("enabled", False),
+            channel=d.get("channel", 0),
+            segments=[DroneSegmentConfig.from_dict(s) for s in d.get("segments", [])],
+        )
+
+
+FX_MAX_SEGMENTS = 8
+
+
+@dataclasses.dataclass
+class FxSegmentConfig:
+    """One FX rack segment: always two encoders (never pots), an enable
+    button gating both encoders' CC to the DAW, and a shift button shared by
+    both encoders. No PWM/VU-meter pin -- just the on/shift lights, wired the
+    same listen_pin way as DroneSegmentConfig's."""
+    encoder1_pin: Optional[int] = None     # encoder_a; pin+1 is its encoder_b partner
+    encoder2_pin: Optional[int] = None     # encoder_a; pin+1 is its encoder_b partner
+    enable_pin: Optional[int] = None       # button_cc+toggle; gates BOTH encoders' CC
+    shift_pin: Optional[int] = None        # button_shift; shared by both encoders
+    on_light_pin: Optional[int] = None     # light_digital/pwm, listen_pin -> enable_pin
+    shift_light_pin: Optional[int] = None  # light_digital/pwm, listen_pin -> shift_pin
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_dict(d) -> "FxSegmentConfig":
+        return FxSegmentConfig(**{k: v for k, v in d.items() if k in FxSegmentConfig.__dataclass_fields__})
+
+
+@dataclasses.dataclass
+class FxRackConfig:
+    """App-only FX rack config for an Entry -- same treatment as
+    SequencerConfig/DroneConfig: not part of the EEPROM blob, live enabled
+    state lives on the DeviceSession's FxRackEngine, not here."""
+    enabled: bool = False
+    channel: int = 0  # shared MIDI channel for every segment's encoder/enable pins
+    segments: List[FxSegmentConfig] = dataclasses.field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "enabled": self.enabled,
+            "channel": self.channel,
+            "segments": [s.to_dict() for s in self.segments],
+        }
+
+    @staticmethod
+    def from_dict(d) -> "FxRackConfig":
+        return FxRackConfig(
+            enabled=d.get("enabled", False),
+            channel=d.get("channel", 0),
+            segments=[FxSegmentConfig.from_dict(s) for s in d.get("segments", [])],
+        )
+
+
+@dataclasses.dataclass
+class JoystickConfig:
+    """App-only joystick config for an Entry: a single fixed X/Y/rotation +
+    button widget, not a repeatable list. Every pin here is an ordinary
+    existing role (pot_cc for the three axes, button_note/button_cc for the
+    click) -- the firmware has no composite "joystick" concept at all, so
+    there's no engine: all four pins just flow through the normal pin-role
+    dispatch like any other input."""
+    enabled: bool = False
+    x_pin: Optional[int] = None       # pot_cc
+    y_pin: Optional[int] = None       # pot_cc
+    z_pin: Optional[int] = None       # pot_cc (rotation/twist axis)
+    button_pin: Optional[int] = None  # button_note | button_cc
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_dict(d) -> "JoystickConfig":
+        return JoystickConfig(**{k: v for k, v in d.items() if k in JoystickConfig.__dataclass_fields__})
+
+
 @dataclasses.dataclass
 class Entry:
     id: str  # str(device_id) for a device entry, "draft-<hex>" for a draft
@@ -178,6 +311,9 @@ class Entry:
     pins: List[PinConfig] = dataclasses.field(default_factory=list)
     device_id: int = 0  # meaningful only when entry_type == "device"
     sequencer: SequencerConfig = dataclasses.field(default_factory=SequencerConfig)
+    drone: DroneConfig = dataclasses.field(default_factory=DroneConfig)
+    fx_rack: FxRackConfig = dataclasses.field(default_factory=FxRackConfig)
+    joystick: JoystickConfig = dataclasses.field(default_factory=JoystickConfig)
 
     @staticmethod
     def blank(id_: str, entry_type: str, nickname: str, device_id: int = 0) -> "Entry":
@@ -205,6 +341,9 @@ class Entry:
             "device_id": self.device_id,
             "pins": [p.to_dict() for p in self.pins],
             "sequencer": self.sequencer.to_dict(),
+            "drone": self.drone.to_dict(),
+            "fx_rack": self.fx_rack.to_dict(),
+            "joystick": self.joystick.to_dict(),
         }
 
     @staticmethod
@@ -216,6 +355,9 @@ class Entry:
             device_id=d.get("device_id", 0),
             pins=[PinConfig.from_dict(p) for p in d["pins"]],
             sequencer=SequencerConfig.from_dict(d["sequencer"]) if "sequencer" in d else SequencerConfig(),
+            drone=DroneConfig.from_dict(d["drone"]) if "drone" in d else DroneConfig(),
+            fx_rack=FxRackConfig.from_dict(d["fx_rack"]) if "fx_rack" in d else FxRackConfig(),
+            joystick=JoystickConfig.from_dict(d["joystick"]) if "joystick" in d else JoystickConfig(),
         )
 
     @staticmethod

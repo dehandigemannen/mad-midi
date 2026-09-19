@@ -174,6 +174,11 @@ const state = {
   reconnectPorts: [],
   sequencer: null, // {channel, subdivision, steps: [...]} for the selected entry
   sequencerLive: null, // {device_id, running, current_step, step_enabled} pushed from a connected device, or null
+  drone: null, // {enabled, channel, control_type, segments: [...]} for the selected entry
+  droneLive: null, // {device_id, enabled: [...]} pushed from a connected device, or null
+  fxRack: null, // {enabled, channel, segments: [...]} for the selected entry
+  fxRackLive: null, // {device_id, enabled: [...]} pushed from a connected device, or null
+  joystick: null, // {enabled, x_pin, y_pin, z_pin, button_pin} for the selected entry
   flashingId: null, // entry id currently mid flash_firmware() call, or null -- keeps the button disabled/labeled through the operation's own disconnect/reconnect
 };
 
@@ -230,16 +235,27 @@ function setPinField(pin, field, value) {
 // ---- auto-save -------------------------------------------------------------
 
 function scheduleAutoSave() {
-  // Saves pins and sequencer together in one call — they used to be two
-  // independent debounced saves and could race each other into corrupting
-  // the file when both fired ~400ms apart (see update_entry_pins).
+  // Saves pins and every feature config together in one call — independent
+  // debounced saves could race each other into corrupting the file when
+  // they fire ~400ms apart (see update_entry_pins).
   if (!state.selectedId || state.selectedId === ALL_DEVICES_ID) return;
   const id = state.selectedId;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     const pinsSnapshot = state.pins.map((p) => ({ ...p }));
     const sequencerSnapshot = JSON.parse(JSON.stringify(state.sequencer));
-    const status = await api("update_entry_pins", id, pinsSnapshot, sequencerSnapshot);
+    const droneSnapshot = JSON.parse(JSON.stringify(state.drone));
+    const fxRackSnapshot = JSON.parse(JSON.stringify(state.fxRack));
+    const joystickSnapshot = JSON.parse(JSON.stringify(state.joystick));
+    const status = await api(
+      "update_entry_pins",
+      id,
+      pinsSnapshot,
+      sequencerSnapshot,
+      droneSnapshot,
+      fxRackSnapshot,
+      joystickSnapshot,
+    );
     applyEntryStatus(status);
   }, 400);
 }
@@ -254,11 +270,121 @@ function applyEntryStatus(status) {
   renderHeader();
 }
 
+// ---- value mirror (encoder/pot -> PWM VU meter), generalized --------------
+// Any encoder_a/pot_cc pin can mirror its live value onto a light_pwm pin's
+// brightness via PinConfig.mirror_pin -- not just a sequencer step's or a
+// drone segment's. See app/value_mirror.py for the engine that drives this
+// app-side (the firmware has no idea it's happening).
+
+function linkMirror(controlPin, pwmPin) {
+  if (controlPin === null || controlPin === undefined) return;
+  pinByIndex(controlPin).mirror_pin = pwmPin;
+}
+
+function unlinkMirror(controlPin) {
+  if (controlPin === null || controlPin === undefined) return;
+  pinByIndex(controlPin).mirror_pin = NO_SHIFT_PIN;
+}
+
+// ---- shared pin release (sequencer step / drone / fx segment slots) -------
+// Releases a pin previously used by any composite feature back to "unused",
+// undoing any encoder-pairing or cross-pin references (shift-group, listen,
+// mirror) it was part of.
+function clearAssignedPin(pin) {
+  const p = pinByIndex(pin);
+  if (p.role === "encoder_a" && pin + 1 < PIN_COUNT) {
+    const partner = pinByIndex(pin + 1);
+    if (partner.role === "encoder_b") partner.role = "unused";
+  }
+  if (p.role === "button_shift") {
+    state.pins.forEach((pp) => {
+      if (pp.role === "encoder_a" && pp.in_min === pin) pp.in_min = NO_SHIFT_PIN;
+      if (pp.role === "pot_cc" && pp.shift_pin === pin) pp.shift_pin = NO_SHIFT_PIN;
+    });
+  }
+  // if this pin was a mirror target (a PWM meter) or a listen target (an
+  // on/shift light), unlink whichever pin pointed at it
+  state.pins.forEach((pp) => {
+    if (pp.mirror_pin === pin) pp.mirror_pin = NO_SHIFT_PIN;
+    if (pp.listen_pin === pin) pp.listen_pin = NO_SHIFT_PIN;
+  });
+  p.role = "unused";
+}
+
+// Wires a light pin to directly mirror a button/shift pin's physical state
+// (firmware's listen_pin mechanism, roles.cpp's applyListenLights()) instead
+// of matching an incoming Note/CC -- used for a segment's on/shift indicator
+// lights (Drone, FX Rack), which need no MIDI channel/number at all.
+function assignListenLight(pin, sourcePin) {
+  const p = pinByIndex(pin);
+  p.role = PWM_PINS.has(pin) ? "light_pwm" : "light_digital";
+  if (p.role === "light_pwm") {
+    p.in_min = 0;
+    p.in_max = 127;
+    p.out_min = 0;
+    p.out_max = 255;
+  }
+  p.listen_pin = sourcePin === null || sourcePin === undefined ? NO_SHIFT_PIN : sourcePin;
+}
+
+// Shared by any feature with an encoder/pot value control plus an optional
+// shift button (Sequencer steps, Drone segments, FX Rack's two encoders):
+// makes the link (set automatically whichever order the two are assigned
+// in) visible, since otherwise there's no way to tell that turning the
+// control while holding shift actually sends a different CC.
+function buildShiftLinkHint(obj, controlField, shiftField, controlType) {
+  const hint = document.createElement("div");
+  hint.className = "field-hint sequencer-link-hint";
+  const hasControl = obj[controlField] !== null && obj[controlField] !== undefined;
+  const hasShift = obj[shiftField] !== null && obj[shiftField] !== undefined;
+  const noun = controlType === "pot" ? "pot" : "encoder";
+
+  if (hasControl && hasShift) {
+    const ctrl = pinByIndex(obj[controlField]);
+    const shiftedCc = ctrl.role === "pot_cc" ? ctrl.shift_number : ctrl.out_max;
+    hint.textContent = `✓ Shift linked — plain turn sends CC ${ctrl.number}, shift+turn sends CC ${shiftedCc} (both on channel ${ctrl.channel + 1})`;
+  } else if (hasControl && !hasShift) {
+    hint.textContent = `No shift assigned — this ${noun} always sends its plain CC.`;
+  } else if (!hasControl && hasShift) {
+    hint.textContent = `This shift button isn't linked to anything yet — assign this ${noun} to link it.`;
+  } else {
+    hint.hidden = true;
+  }
+  return hint;
+}
+
+// Shared by any feature where each item (a Sequencer step, a Drone segment)
+// independently chooses whether its own value control is an encoder or a
+// pot -- switching doesn't move that item's already-assigned pin (its
+// actual role may now mismatch), so a hint below the picker says so.
+function buildControlTypeSelect(currentType, onChange) {
+  const wrap = document.createElement("div");
+  wrap.className = "field-row";
+  const label = document.createElement("label");
+  label.textContent = "Value control";
+  const select = document.createElement("select");
+  [
+    ["encoder", "Encoder (2-pin, relative)"],
+    ["pot", "Pot/Fader (analog pin, absolute)"],
+  ].forEach(([value, text]) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = text;
+    if (value === (currentType || "encoder")) opt.selected = true;
+    select.appendChild(opt);
+  });
+  select.addEventListener("change", () => onChange(select.value));
+  wrap.appendChild(label);
+  wrap.appendChild(select);
+  return wrap;
+}
+
 // ---- sequencer: pin assignment (mirrors setPinRole's cleanup-then-assign) --
 
 function blankSequencerStep(index) {
   return {
     note: 60 + index, // auto-assigned, still freely editable via the Note dropdown
+    control_type: "encoder", // "encoder" | "pot" -- this step's own choice, independent of other steps
     button_pin: null,
     encoder_pin: null,
     shift_pin: null,
@@ -284,7 +410,7 @@ function sequencerEligiblePins(stepIndex, fn) {
   const step = state.sequencer.steps[stepIndex];
   const currentlyAssigned = step[fn + "_pin"];
   const needsPwm = SEQ_FNS_NEEDING_PWM.has(fn);
-  const isPotControl = fn === "encoder" && state.sequencer.step_control === "pot";
+  const isPotControl = fn === "encoder" && step.control_type === "pot";
 
   // Pot mode needs a single analog pin (A0-A15), not a digital pin pair --
   // a completely different eligibility rule from the encoder's, so it's
@@ -326,29 +452,12 @@ function sequencerEligiblePins(stepIndex, fn) {
   return result;
 }
 
-// Releases a pin previously used by a sequencer function back to "unused",
-// undoing any encoder-pairing/shift-linkage it was part of.
-function clearSequencerPin(pin) {
-  const p = pinByIndex(pin);
-  if (p.role === "encoder_a" && pin + 1 < PIN_COUNT) {
-    const partner = pinByIndex(pin + 1);
-    if (partner.role === "encoder_b") partner.role = "unused";
-  }
-  if (p.role === "button_shift") {
-    state.pins.forEach((pp) => {
-      if (pp.role === "encoder_a" && pp.in_min === pin) pp.in_min = NO_SHIFT_PIN;
-      if (pp.role === "pot_cc" && pp.shift_pin === pin) pp.shift_pin = NO_SHIFT_PIN;
-    });
-  }
-  p.role = "unused";
-}
-
 function assignSequencerPin(stepIndex, fn, pin) {
   const step = state.sequencer.steps[stepIndex];
   const field = fn + "_pin";
   const prevPin = step[field];
   if (prevPin !== null && prevPin !== undefined && prevPin !== pin) {
-    clearSequencerPin(prevPin);
+    clearAssignedPin(prevPin);
   }
   step[field] = pin === null || pin === undefined ? null : pin;
 
@@ -365,7 +474,7 @@ function assignSequencerPin(stepIndex, fn, pin) {
       p.channel = ch;
       p.number = SEQ_BASE.button + stepIndex;
     } else if (fn === "encoder") {
-      if (state.sequencer.step_control === "pot") {
+      if (step.control_type === "pot") {
         p.role = "pot_cc";
         p.channel = ch;
         p.number = SEQ_BASE.encoder + stepIndex;
@@ -396,11 +505,15 @@ function assignSequencerPin(stepIndex, fn, pin) {
           p.out_max = SEQ_BASE.encoder_shifted + stepIndex;
         }
       }
+      p.mirror_pin = NO_SHIFT_PIN;
+      if (step.pwm_pin !== null && step.pwm_pin !== undefined) {
+        linkMirror(pin, step.pwm_pin);
+      }
     } else if (fn === "shift") {
       p.role = "button_shift";
       if (step.encoder_pin !== null && step.encoder_pin !== undefined) {
         const enc = pinByIndex(step.encoder_pin);
-        if (state.sequencer.step_control === "pot") {
+        if (step.control_type === "pot") {
           enc.shift_pin = pin;
           enc.shift_channel = ch;
           enc.shift_number = SEQ_BASE.encoder_shifted + stepIndex;
@@ -416,7 +529,8 @@ function assignSequencerPin(stepIndex, fn, pin) {
       p.channel = ch;
       p.number = SEQ_BASE.step_light + stepIndex;
     } else if (fn === "pwm") {
-      // Value meter: mirrors the encoder's live CC output as PWM brightness.
+      // Value meter: mirrors the encoder's live CC output as PWM brightness
+      // (see linkMirror -- generalized value_mirror.py, not sequencer-only).
       p.role = "light_pwm";
       p.match_cc = true;
       p.channel = ch;
@@ -425,6 +539,9 @@ function assignSequencerPin(stepIndex, fn, pin) {
       p.in_max = 127;
       p.out_min = 0;
       p.out_max = 255;
+      if (step.encoder_pin !== null && step.encoder_pin !== undefined) {
+        linkMirror(step.encoder_pin, pin);
+      }
     } else if (fn === "enabled_light") {
       // Tracks the step's on/off (enabled) state, not trigger flashes.
       // Any light-capable pin is allowed: a PWM-capable pin gets driven at
@@ -456,7 +573,7 @@ function setStepCount(n) {
     for (let i = n; i < steps.length; i++) {
       Object.keys(SEQ_FN_LABELS).forEach((fn) => {
         const pin = steps[i][fn + "_pin"];
-        if (pin !== null && pin !== undefined) clearSequencerPin(pin);
+        if (pin !== null && pin !== undefined) clearAssignedPin(pin);
       });
     }
     steps.length = n;
@@ -495,14 +612,11 @@ function setSequencerSubdivision(value) {
   scheduleAutoSave();
 }
 
-function setSequencerEnabled(value) {
-  state.sequencer.enabled = value;
-  scheduleAutoSave();
-  renderAll();
-}
-
-function setSequencerStepControl(value) {
-  state.sequencer.step_control = value;
+function setStepControlType(stepIndex, value) {
+  // Switching doesn't move the step's already-assigned pin (its actual role
+  // may now mismatch the new choice) -- reassign it below after switching,
+  // same as the old device-wide toggle warned.
+  state.sequencer.steps[stepIndex].control_type = value;
   scheduleAutoSave();
   renderAll();
 }
@@ -807,6 +921,7 @@ function renderEditor() {
     renderShiftFields(pin, p, fields, { pinField: "in_min", chField: "out_min", ccField: "out_max" });
   if (p.role === "pot_cc")
     renderShiftFields(pin, p, fields, { pinField: "shift_pin", chField: "shift_channel", ccField: "shift_number" });
+  if (p.role === "encoder_a" || p.role === "pot_cc") renderMirrorField(pin, p, fields);
 }
 
 function renderNumberField(pin, p, fields) {
@@ -1006,6 +1121,55 @@ function renderListenField(pin, p, fields) {
   }
 }
 
+// encoder_a/pot_cc only: pick a light_pwm pin whose brightness should track
+// this control's live value (a VU meter) -- generalizes the sequencer/drone
+// step's dedicated "pwm" pin-picker to any encoder or pot, in or out of a
+// composite feature. Same picker pattern as renderShiftFields/
+// renderListenField, backed by PinConfig.mirror_pin (see value_mirror.py).
+function renderMirrorField(pin, p, fields) {
+  const targets = state.pins
+    .map((pp, idx) => ({ idx, pp }))
+    .filter(({ idx, pp }) => pp.role === "light_pwm" && idx !== pin);
+
+  const row = document.createElement("div");
+  row.className = "field-row";
+  const label = document.createElement("label");
+  label.textContent = "Mirror value to PWM pin (VU meter)";
+  const select = document.createElement("select");
+
+  const noneOpt = document.createElement("option");
+  noneOpt.value = String(NO_SHIFT_PIN);
+  noneOpt.textContent = "None";
+  select.appendChild(noneOpt);
+
+  targets.forEach(({ idx }) => {
+    const opt = document.createElement("option");
+    opt.value = String(idx);
+    opt.textContent = `Pin ${pinLabel(idx)} (#${idx})`;
+    select.appendChild(opt);
+  });
+
+  const validIds = new Set([NO_SHIFT_PIN, ...targets.map((t) => t.idx)]);
+  const current = p.mirror_pin;
+  select.value = validIds.has(current) ? String(current) : String(NO_SHIFT_PIN);
+
+  select.addEventListener("change", () => {
+    setPinField(pin, "mirror_pin", parseInt(select.value, 10));
+    renderAll();
+  });
+  row.appendChild(label);
+  row.appendChild(select);
+  fields.appendChild(row);
+
+  if (targets.length === 0) {
+    const hint = document.createElement("div");
+    hint.className = "field-hint";
+    hint.textContent =
+      'No PWM light pins configured yet — set another pin\'s role to "Light/VU (PWM)" first.';
+    fields.appendChild(hint);
+  }
+}
+
 // ---- rendering: sequencer view ----------------------------------------------
 
 function renderSequencerTab() {
@@ -1017,55 +1181,6 @@ function renderSequencerSettings() {
   const el = document.getElementById("sequencerSettings");
   el.innerHTML = "";
   const seq = state.sequencer;
-
-  const enabledRow = document.createElement("div");
-  enabledRow.className = "field-row checkbox";
-  const enabledLabel = document.createElement("label");
-  enabledLabel.className = "checkbox-label";
-  const enabledInput = document.createElement("input");
-  enabledInput.type = "checkbox";
-  enabledInput.checked = seq.enabled;
-  enabledInput.addEventListener("change", () => setSequencerEnabled(enabledInput.checked));
-  const enabledText = document.createElement("span");
-  enabledText.textContent = "Sequencer enabled";
-  enabledLabel.appendChild(enabledInput);
-  enabledLabel.appendChild(enabledText);
-  enabledRow.appendChild(enabledLabel);
-  el.appendChild(enabledRow);
-
-  if (!seq.enabled) {
-    const disabledHint = document.createElement("div");
-    disabledHint.className = "field-hint";
-    disabledHint.textContent =
-      "Disabled — this device passes MIDI straight through and ignores transport, as if no sequencer pins were configured. The setup below is kept, so you can still edit it while it's off.";
-    el.appendChild(disabledHint);
-  }
-
-  const controlRow = document.createElement("div");
-  controlRow.className = "field-row";
-  const controlLabel = document.createElement("label");
-  controlLabel.textContent = "Step value control";
-  const controlSelect = document.createElement("select");
-  [
-    ["encoder", "Encoder (2-pin, relative)"],
-    ["pot", "Pot/Fader (analog pin, absolute)"],
-  ].forEach(([value, text]) => {
-    const opt = document.createElement("option");
-    opt.value = value;
-    opt.textContent = text;
-    if (value === (seq.step_control || "encoder")) opt.selected = true;
-    controlSelect.appendChild(opt);
-  });
-  controlSelect.addEventListener("change", () => setSequencerStepControl(controlSelect.value));
-  controlRow.appendChild(controlLabel);
-  controlRow.appendChild(controlSelect);
-  el.appendChild(controlRow);
-
-  const controlHint = document.createElement("div");
-  controlHint.className = "field-hint";
-  controlHint.textContent =
-    "Applies to every step's value control. Switching doesn't move already-assigned pins — reassign each step's pin below after switching.";
-  el.appendChild(controlHint);
 
   const countRow = document.createElement("div");
   countRow.className = "field-row";
@@ -1128,11 +1243,11 @@ function renderSequencerSettings() {
 }
 
 function buildSequencerPinSelect(stepIndex, fn, currentPin) {
+  const step = state.sequencer.steps[stepIndex];
   const wrap = document.createElement("div");
   wrap.className = "field-row";
   const label = document.createElement("label");
-  label.textContent =
-    fn === "encoder" && state.sequencer.step_control === "pot" ? "Pot" : SEQ_FN_LABELS[fn];
+  label.textContent = fn === "encoder" && step.control_type === "pot" ? "Pot" : SEQ_FN_LABELS[fn];
   wrap.appendChild(label);
 
   const select = document.createElement("select");
@@ -1164,31 +1279,6 @@ function buildSequencerPinSelect(stepIndex, fn, currentPin) {
   return wrap;
 }
 
-// Makes the encoder/pot <-> shift link (set automatically by
-// assignSequencerPin, whichever order the two are assigned in) visible --
-// otherwise there's no way to tell from this tab alone that turning the
-// encoder/pot while holding shift actually sends a different CC.
-function buildEncoderShiftLinkHint(step) {
-  const hint = document.createElement("div");
-  hint.className = "field-hint sequencer-link-hint";
-  const hasEncoder = step.encoder_pin !== null && step.encoder_pin !== undefined;
-  const hasShift = step.shift_pin !== null && step.shift_pin !== undefined;
-  const noun = state.sequencer.step_control === "pot" ? "pot" : "encoder";
-
-  if (hasEncoder && hasShift) {
-    const enc = pinByIndex(step.encoder_pin);
-    const shiftedCc = enc.role === "pot_cc" ? enc.shift_number : enc.out_max;
-    hint.textContent = `✓ Shift linked — plain turn sends CC ${enc.number}, shift+turn sends CC ${shiftedCc} (both on channel ${enc.channel + 1})`;
-  } else if (hasEncoder && !hasShift) {
-    hint.textContent = `No shift assigned — this ${noun} always sends its plain CC.`;
-  } else if (!hasEncoder && hasShift) {
-    hint.textContent = `This shift button isn't linked to anything yet — assign this step's ${noun} to link it.`;
-  } else {
-    hint.hidden = true;
-  }
-  return hint;
-}
-
 function renderSequencerSteps() {
   const container = document.getElementById("sequencerSteps");
   container.innerHTML = "";
@@ -1198,11 +1288,11 @@ function renderSequencerSteps() {
 
   state.sequencer.steps.forEach((step, i) => {
     const row = document.createElement("div");
-    row.className = "sequencer-step";
+    row.className = "segment-card";
     if (live && live.running && live.current_step === i) row.classList.add("playhead");
 
     const heading = document.createElement("div");
-    heading.className = "sequencer-step-heading";
+    heading.className = "segment-card-heading";
     heading.textContent = `Step ${i + 1}`;
     row.appendChild(heading);
 
@@ -1231,16 +1321,806 @@ function renderSequencerSteps() {
     noteRow.appendChild(buildNoteSelect(step.note, (v) => setStepNote(i, v)));
     row.appendChild(noteRow);
 
+    row.appendChild(buildControlTypeSelect(step.control_type, (v) => setStepControlType(i, v)));
     row.appendChild(buildSequencerPinSelect(i, "button", step.button_pin));
     row.appendChild(buildSequencerPinSelect(i, "encoder", step.encoder_pin));
     row.appendChild(buildSequencerPinSelect(i, "shift", step.shift_pin));
     row.appendChild(buildSequencerPinSelect(i, "pwm", step.pwm_pin));
     row.appendChild(buildSequencerPinSelect(i, "step_light", step.step_light_pin));
     row.appendChild(buildSequencerPinSelect(i, "enabled_light", step.enabled_light_pin));
-    row.appendChild(buildEncoderShiftLinkHint(step));
+    row.appendChild(buildShiftLinkHint(step, "encoder_pin", "shift_pin", step.control_type));
 
     container.appendChild(row);
   });
+}
+
+// ---- drone: pin assignment + rendering -------------------------------------
+// A drone segment's shape mirrors a sequencer step's control cluster
+// (control/enable/shift/pwm/lights), but behaves differently: it never
+// sends a Note, its enable button just gates whether its value control's CC
+// reaches the DAW (app/gated_segments.py), and its on/shift lights are
+// wired via listen_pin (assignListenLight) rather than matched CC/Note, so
+// they track the button's physical/toggled state with zero MIDI round-trip.
+
+const DRONE_BASE = { enable: 0, control: 8, control_shifted: 16, pwm: 24 };
+const DRONE_MAX_SEGMENTS = 8;
+const DRONE_SEGMENT_PIN_FIELDS = [
+  "control_pin",
+  "enable_pin",
+  "shift_pin",
+  "pwm_pin",
+  "on_light_pin",
+  "shift_light_pin",
+];
+const DRONE_FN_LABELS = {
+  control: "Encoder",
+  enable: "Enable",
+  shift: "Shift",
+  pwm: "PWM (VU meter)",
+  on_light: "On light",
+  shift_light: "Shift light",
+};
+
+function blankDroneSegment() {
+  return {
+    control_type: "encoder", // "encoder" | "pot" -- this segment's own choice, independent of other segments
+    control_pin: null,
+    enable_pin: null,
+    shift_pin: null,
+    pwm_pin: null,
+    on_light_pin: null,
+    shift_light_pin: null,
+  };
+}
+
+// Same eligibility shape as sequencerEligiblePins, minus step_light (drones
+// have no trigger flash, only the on/shift indicator lights).
+function droneEligiblePins(segmentIndex, fn) {
+  const seg = state.drone.segments[segmentIndex];
+  const currentlyAssigned = seg[fn + "_pin"];
+  const needsPwm = fn === "pwm";
+  const isPotControl = fn === "control" && seg.control_type === "pot";
+
+  if (isPotControl) {
+    const result = [];
+    for (let pin = 54; pin < PIN_COUNT; pin++) {
+      if (pin === currentlyAssigned) {
+        result.push(pin);
+        continue;
+      }
+      if (pinByIndex(pin).role !== "unused") continue;
+      result.push(pin);
+    }
+    return result;
+  }
+
+  const maxPin = fn === "control" ? 53 : fn === "on_light" || fn === "shift_light" ? PIN_COUNT : 54;
+  const result = [];
+  for (let pin = 0; pin < maxPin; pin++) {
+    if (RESERVED_PINS.has(pin)) continue;
+    if (pin === currentlyAssigned) {
+      result.push(pin);
+      continue;
+    }
+    if (needsPwm && !PWM_PINS.has(pin)) continue;
+    if (pinByIndex(pin).role !== "unused") continue;
+    if (fn === "control") {
+      if (pin + 1 >= PIN_COUNT || RESERVED_PINS.has(pin + 1)) continue;
+      if (pinByIndex(pin + 1).role !== "unused") continue;
+    }
+    result.push(pin);
+  }
+  return result;
+}
+
+function assignDronePin(segmentIndex, fn, pin) {
+  const seg = state.drone.segments[segmentIndex];
+  const field = fn + "_pin";
+  const prevPin = seg[field];
+  if (prevPin !== null && prevPin !== undefined && prevPin !== pin) {
+    clearAssignedPin(prevPin);
+  }
+  seg[field] = pin === null || pin === undefined ? null : pin;
+
+  if (pin !== null && pin !== undefined) {
+    const p = pinByIndex(pin);
+    const ch = state.drone.channel;
+    if (fn === "control") {
+      if (seg.control_type === "pot") {
+        p.role = "pot_cc";
+        p.channel = ch;
+        p.number = DRONE_BASE.control + segmentIndex;
+        p.in_min = 0;
+        p.in_max = 255;
+        p.out_min = 0;
+        p.out_max = 127;
+        p.shift_pin = NO_SHIFT_PIN;
+        if (seg.shift_pin !== null && seg.shift_pin !== undefined) {
+          p.shift_pin = seg.shift_pin;
+          p.shift_channel = ch;
+          p.shift_number = DRONE_BASE.control_shifted + segmentIndex;
+        }
+      } else {
+        p.role = "encoder_a";
+        p.channel = ch;
+        p.number = DRONE_BASE.control + segmentIndex;
+        p.in_min = NO_SHIFT_PIN;
+        if (pin + 1 < PIN_COUNT && !RESERVED_PINS.has(pin + 1)) {
+          const partner = pinByIndex(pin + 1);
+          partner.role = "encoder_b";
+          partner.channel = ch;
+          partner.number = p.number;
+        }
+        if (seg.shift_pin !== null && seg.shift_pin !== undefined) {
+          p.in_min = seg.shift_pin;
+          p.out_min = ch;
+          p.out_max = DRONE_BASE.control_shifted + segmentIndex;
+        }
+      }
+      p.mirror_pin = NO_SHIFT_PIN;
+      if (seg.pwm_pin !== null && seg.pwm_pin !== undefined) {
+        linkMirror(pin, seg.pwm_pin);
+      }
+    } else if (fn === "enable") {
+      // A drone never sends a Note -- enabling it just gates whether
+      // control_pin's CC reaches the DAW (see app/gated_segments.py).
+      // Toggle mode (not momentary) so the on-light reflects sustained
+      // on/off state without holding the button down.
+      p.role = "button_cc";
+      p.toggle = true;
+      p.channel = ch;
+      p.number = DRONE_BASE.enable + segmentIndex;
+      if (seg.on_light_pin !== null && seg.on_light_pin !== undefined) {
+        assignListenLight(seg.on_light_pin, pin);
+      }
+    } else if (fn === "shift") {
+      p.role = "button_shift";
+      if (seg.control_pin !== null && seg.control_pin !== undefined) {
+        const ctrl = pinByIndex(seg.control_pin);
+        if (seg.control_type === "pot") {
+          ctrl.shift_pin = pin;
+          ctrl.shift_channel = ch;
+          ctrl.shift_number = DRONE_BASE.control_shifted + segmentIndex;
+        } else {
+          ctrl.in_min = pin;
+          ctrl.out_min = ch;
+          ctrl.out_max = DRONE_BASE.control_shifted + segmentIndex;
+        }
+      }
+      if (seg.shift_light_pin !== null && seg.shift_light_pin !== undefined) {
+        assignListenLight(seg.shift_light_pin, pin);
+      }
+    } else if (fn === "pwm") {
+      p.role = "light_pwm";
+      p.match_cc = true;
+      p.channel = ch;
+      p.number = DRONE_BASE.pwm + segmentIndex;
+      p.in_min = 0;
+      p.in_max = 127;
+      p.out_min = 0;
+      p.out_max = 255;
+      if (seg.control_pin !== null && seg.control_pin !== undefined) {
+        linkMirror(seg.control_pin, pin);
+      }
+    } else if (fn === "on_light") {
+      assignListenLight(pin, seg.enable_pin);
+    } else if (fn === "shift_light") {
+      assignListenLight(pin, seg.shift_pin);
+    }
+  }
+
+  scheduleAutoSave();
+  renderAll();
+}
+
+function setDroneSegmentCount(n) {
+  n = Math.max(1, Math.min(DRONE_MAX_SEGMENTS, n || 1));
+  const segments = state.drone.segments;
+  if (n < segments.length) {
+    for (let i = n; i < segments.length; i++) {
+      DRONE_SEGMENT_PIN_FIELDS.forEach((field) => {
+        const pin = segments[i][field];
+        if (pin !== null && pin !== undefined) clearAssignedPin(pin);
+      });
+    }
+    segments.length = n;
+  } else {
+    while (segments.length < n) segments.push(blankDroneSegment());
+  }
+  scheduleAutoSave();
+  renderAll();
+}
+
+function setDroneChannel(value) {
+  state.drone.channel = value;
+  state.drone.segments.forEach((seg) => {
+    ["control", "enable", "pwm"].forEach((fn) => {
+      const pin = seg[fn + "_pin"];
+      if (pin !== null && pin !== undefined) pinByIndex(pin).channel = value;
+    });
+    if (seg.control_pin !== null && seg.control_pin !== undefined) {
+      const ctrl = pinByIndex(seg.control_pin);
+      if (ctrl.role === "pot_cc") {
+        if (ctrl.shift_pin !== NO_SHIFT_PIN) ctrl.shift_channel = value;
+      } else {
+        if (ctrl.in_min !== NO_SHIFT_PIN) ctrl.out_min = value;
+        if (seg.control_pin + 1 < PIN_COUNT) pinByIndex(seg.control_pin + 1).channel = value;
+      }
+    }
+  });
+  scheduleAutoSave();
+  renderAll();
+}
+
+function setDroneSegmentControlType(segmentIndex, value) {
+  state.drone.segments[segmentIndex].control_type = value;
+  scheduleAutoSave();
+  renderAll();
+}
+
+function renderDroneTab() {
+  renderDroneSettings();
+  renderDroneSegments();
+}
+
+function renderDroneSettings() {
+  const el = document.getElementById("droneSettings");
+  el.innerHTML = "";
+  const d = state.drone;
+
+  const countRow = document.createElement("div");
+  countRow.className = "field-row";
+  const countLabel = document.createElement("label");
+  countLabel.textContent = "Segments";
+  const countInput = document.createElement("input");
+  countInput.type = "number";
+  countInput.min = 1;
+  countInput.max = DRONE_MAX_SEGMENTS;
+  countInput.value = d.segments.length;
+  countInput.addEventListener("change", () => setDroneSegmentCount(parseInt(countInput.value, 10)));
+  countRow.appendChild(countLabel);
+  countRow.appendChild(countInput);
+  el.appendChild(countRow);
+
+  const chRow = document.createElement("div");
+  chRow.className = "field-row";
+  const chLabel = document.createElement("label");
+  chLabel.textContent = "MIDI Channel";
+  const chInput = document.createElement("input");
+  chInput.type = "number";
+  chInput.min = 1;
+  chInput.max = 16;
+  chInput.value = d.channel + 1;
+  chInput.addEventListener("change", () => {
+    const v = Math.max(1, Math.min(16, parseInt(chInput.value, 10) || 1)) - 1;
+    setDroneChannel(v);
+  });
+  chRow.appendChild(chLabel);
+  chRow.appendChild(chInput);
+  el.appendChild(chRow);
+
+  const hint = document.createElement("div");
+  hint.className = "field-hint";
+  hint.textContent =
+    "Each segment's enable button toggles whether its value control's CC reaches your DAW — a drone never sends a Note. The on/shift lights mirror their button's physical state directly, with no DAW connection needed.";
+  el.appendChild(hint);
+}
+
+function buildDronePinSelect(segmentIndex, fn, currentPin) {
+  const seg = state.drone.segments[segmentIndex];
+  const wrap = document.createElement("div");
+  wrap.className = "field-row";
+  const label = document.createElement("label");
+  label.textContent = fn === "control" && seg.control_type === "pot" ? "Pot" : DRONE_FN_LABELS[fn];
+  wrap.appendChild(label);
+
+  const select = document.createElement("select");
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+  noneOpt.textContent = "Unassigned";
+  select.appendChild(noneOpt);
+
+  const eligible = droneEligiblePins(segmentIndex, fn);
+  eligible.forEach((pin) => {
+    const opt = document.createElement("option");
+    opt.value = String(pin);
+    opt.textContent = `${pinLabel(pin)} (#${pin})`;
+    select.appendChild(opt);
+  });
+  select.value = currentPin === null || currentPin === undefined ? "" : String(currentPin);
+
+  select.addEventListener("change", () => {
+    assignDronePin(segmentIndex, fn, select.value === "" ? null : parseInt(select.value, 10));
+  });
+  wrap.appendChild(select);
+
+  if (eligible.length === 0 && (currentPin === null || currentPin === undefined)) {
+    const hint = document.createElement("span");
+    hint.className = "field-hint";
+    hint.textContent = "No free pins available";
+    wrap.appendChild(hint);
+  }
+  return wrap;
+}
+
+function renderDroneSegments() {
+  const container = document.getElementById("droneSegments");
+  container.innerHTML = "";
+  const live = state.droneLive;
+  const entry = selectedEntry();
+  const showLive = !!(entry && entry.entry_type === "device" && entry.connected && live);
+
+  state.drone.segments.forEach((seg, i) => {
+    const row = document.createElement("div");
+    row.className = "segment-card";
+    if (showLive && live.enabled[i]) row.classList.add("active");
+
+    const heading = document.createElement("div");
+    heading.className = "segment-card-heading";
+    heading.textContent = `Segment ${i + 1}`;
+    row.appendChild(heading);
+
+    const statusLabel = document.createElement("span");
+    statusLabel.className = "field-hint";
+    statusLabel.textContent = showLive
+      ? live.enabled[i]
+        ? "On (via physical button)"
+        : "Off (via physical button)"
+      : "Connect the device to see live status";
+    row.appendChild(statusLabel);
+
+    row.appendChild(buildControlTypeSelect(seg.control_type, (v) => setDroneSegmentControlType(i, v)));
+    row.appendChild(buildDronePinSelect(i, "control", seg.control_pin));
+    row.appendChild(buildDronePinSelect(i, "enable", seg.enable_pin));
+    row.appendChild(buildDronePinSelect(i, "shift", seg.shift_pin));
+    row.appendChild(buildDronePinSelect(i, "pwm", seg.pwm_pin));
+    row.appendChild(buildDronePinSelect(i, "on_light", seg.on_light_pin));
+    row.appendChild(buildDronePinSelect(i, "shift_light", seg.shift_light_pin));
+    row.appendChild(buildShiftLinkHint(seg, "control_pin", "shift_pin", seg.control_type));
+
+    container.appendChild(row);
+  });
+}
+
+// ---- fx rack: pin assignment + rendering -----------------------------------
+// Each segment is always two encoders + one enable button (gating both at
+// once) + one shared shift button + on/shift lights -- no PWM meter.
+
+const FX_BASE = { enable: 0, encoder1: 8, encoder1_shifted: 16, encoder2: 24, encoder2_shifted: 32 };
+const FX_MAX_SEGMENTS = 8;
+const FX_SEGMENT_PIN_FIELDS = [
+  "encoder1_pin",
+  "encoder2_pin",
+  "enable_pin",
+  "shift_pin",
+  "on_light_pin",
+  "shift_light_pin",
+];
+const FX_FN_LABELS = {
+  encoder1: "Encoder 1",
+  encoder2: "Encoder 2",
+  enable: "Enable",
+  shift: "Shift",
+  on_light: "On light",
+  shift_light: "Shift light",
+};
+
+function blankFxSegment() {
+  return {
+    encoder1_pin: null,
+    encoder2_pin: null,
+    enable_pin: null,
+    shift_pin: null,
+    on_light_pin: null,
+    shift_light_pin: null,
+  };
+}
+
+function fxEligiblePins(segmentIndex, fn) {
+  const seg = state.fxRack.segments[segmentIndex];
+  const currentlyAssigned = seg[fn + "_pin"];
+  const isEncoder = fn === "encoder1" || fn === "encoder2";
+  const maxPin = isEncoder ? 53 : fn === "on_light" || fn === "shift_light" ? PIN_COUNT : 54;
+
+  const result = [];
+  for (let pin = 0; pin < maxPin; pin++) {
+    if (RESERVED_PINS.has(pin)) continue;
+    if (pin === currentlyAssigned) {
+      result.push(pin);
+      continue;
+    }
+    if (pinByIndex(pin).role !== "unused") continue;
+    if (isEncoder) {
+      if (pin + 1 >= PIN_COUNT || RESERVED_PINS.has(pin + 1)) continue;
+      if (pinByIndex(pin + 1).role !== "unused") continue;
+    }
+    result.push(pin);
+  }
+  return result;
+}
+
+function assignFxPin(segmentIndex, fn, pin) {
+  const seg = state.fxRack.segments[segmentIndex];
+  const field = fn + "_pin";
+  const prevPin = seg[field];
+  if (prevPin !== null && prevPin !== undefined && prevPin !== pin) {
+    clearAssignedPin(prevPin);
+  }
+  seg[field] = pin === null || pin === undefined ? null : pin;
+
+  if (pin !== null && pin !== undefined) {
+    const p = pinByIndex(pin);
+    const ch = state.fxRack.channel;
+    if (fn === "encoder1" || fn === "encoder2") {
+      const base = fn === "encoder1" ? FX_BASE.encoder1 : FX_BASE.encoder2;
+      const shiftedBase = fn === "encoder1" ? FX_BASE.encoder1_shifted : FX_BASE.encoder2_shifted;
+      p.role = "encoder_a";
+      p.channel = ch;
+      p.number = base + segmentIndex;
+      p.in_min = NO_SHIFT_PIN;
+      if (pin + 1 < PIN_COUNT && !RESERVED_PINS.has(pin + 1)) {
+        const partner = pinByIndex(pin + 1);
+        partner.role = "encoder_b";
+        partner.channel = ch;
+        partner.number = p.number;
+      }
+      if (seg.shift_pin !== null && seg.shift_pin !== undefined) {
+        p.in_min = seg.shift_pin;
+        p.out_min = ch;
+        p.out_max = shiftedBase + segmentIndex;
+      }
+    } else if (fn === "enable") {
+      // Gates BOTH encoders' CC from reaching the DAW at once (see
+      // app/gated_segments.py) -- toggle mode, same as Drone's.
+      p.role = "button_cc";
+      p.toggle = true;
+      p.channel = ch;
+      p.number = FX_BASE.enable + segmentIndex;
+      if (seg.on_light_pin !== null && seg.on_light_pin !== undefined) {
+        assignListenLight(seg.on_light_pin, pin);
+      }
+    } else if (fn === "shift") {
+      p.role = "button_shift";
+      [
+        ["encoder1_pin", FX_BASE.encoder1_shifted],
+        ["encoder2_pin", FX_BASE.encoder2_shifted],
+      ].forEach(([field2, shiftedBase]) => {
+        const encPin = seg[field2];
+        if (encPin !== null && encPin !== undefined) {
+          const enc = pinByIndex(encPin);
+          enc.in_min = pin;
+          enc.out_min = ch;
+          enc.out_max = shiftedBase + segmentIndex;
+        }
+      });
+      if (seg.shift_light_pin !== null && seg.shift_light_pin !== undefined) {
+        assignListenLight(seg.shift_light_pin, pin);
+      }
+    } else if (fn === "on_light") {
+      assignListenLight(pin, seg.enable_pin);
+    } else if (fn === "shift_light") {
+      assignListenLight(pin, seg.shift_pin);
+    }
+  }
+
+  scheduleAutoSave();
+  renderAll();
+}
+
+function setFxSegmentCount(n) {
+  n = Math.max(1, Math.min(FX_MAX_SEGMENTS, n || 1));
+  const segments = state.fxRack.segments;
+  if (n < segments.length) {
+    for (let i = n; i < segments.length; i++) {
+      FX_SEGMENT_PIN_FIELDS.forEach((field) => {
+        const pin = segments[i][field];
+        if (pin !== null && pin !== undefined) clearAssignedPin(pin);
+      });
+    }
+    segments.length = n;
+  } else {
+    while (segments.length < n) segments.push(blankFxSegment());
+  }
+  scheduleAutoSave();
+  renderAll();
+}
+
+function setFxChannel(value) {
+  state.fxRack.channel = value;
+  state.fxRack.segments.forEach((seg) => {
+    ["encoder1", "encoder2", "enable"].forEach((fn) => {
+      const pin = seg[fn + "_pin"];
+      if (pin !== null && pin !== undefined) pinByIndex(pin).channel = value;
+    });
+    ["encoder1_pin", "encoder2_pin"].forEach((field) => {
+      const encPin = seg[field];
+      if (encPin !== null && encPin !== undefined) {
+        const enc = pinByIndex(encPin);
+        if (enc.in_min !== NO_SHIFT_PIN) enc.out_min = value;
+        if (encPin + 1 < PIN_COUNT) pinByIndex(encPin + 1).channel = value;
+      }
+    });
+  });
+  scheduleAutoSave();
+  renderAll();
+}
+
+function renderFxRackTab() {
+  renderFxRackSettings();
+  renderFxRackSegments();
+}
+
+function renderFxRackSettings() {
+  const el = document.getElementById("fxRackSettings");
+  el.innerHTML = "";
+  const fx = state.fxRack;
+
+  const countRow = document.createElement("div");
+  countRow.className = "field-row";
+  const countLabel = document.createElement("label");
+  countLabel.textContent = "Segments";
+  const countInput = document.createElement("input");
+  countInput.type = "number";
+  countInput.min = 1;
+  countInput.max = FX_MAX_SEGMENTS;
+  countInput.value = fx.segments.length;
+  countInput.addEventListener("change", () => setFxSegmentCount(parseInt(countInput.value, 10)));
+  countRow.appendChild(countLabel);
+  countRow.appendChild(countInput);
+  el.appendChild(countRow);
+
+  const chRow = document.createElement("div");
+  chRow.className = "field-row";
+  const chLabel = document.createElement("label");
+  chLabel.textContent = "MIDI Channel";
+  const chInput = document.createElement("input");
+  chInput.type = "number";
+  chInput.min = 1;
+  chInput.max = 16;
+  chInput.value = fx.channel + 1;
+  chInput.addEventListener("change", () => {
+    const v = Math.max(1, Math.min(16, parseInt(chInput.value, 10) || 1)) - 1;
+    setFxChannel(v);
+  });
+  chRow.appendChild(chLabel);
+  chRow.appendChild(chInput);
+  el.appendChild(chRow);
+
+  const hint = document.createElement("div");
+  hint.className = "field-hint";
+  hint.textContent =
+    "Each segment always has two encoders. Its enable button gates both encoders' CC from reaching your DAW at once; the on/shift lights mirror their button's physical state directly.";
+  el.appendChild(hint);
+}
+
+function buildFxPinSelect(segmentIndex, fn, currentPin) {
+  const wrap = document.createElement("div");
+  wrap.className = "field-row";
+  const label = document.createElement("label");
+  label.textContent = FX_FN_LABELS[fn];
+  wrap.appendChild(label);
+
+  const select = document.createElement("select");
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+  noneOpt.textContent = "Unassigned";
+  select.appendChild(noneOpt);
+
+  const eligible = fxEligiblePins(segmentIndex, fn);
+  eligible.forEach((pin) => {
+    const opt = document.createElement("option");
+    opt.value = String(pin);
+    opt.textContent = `${pinLabel(pin)} (#${pin})`;
+    select.appendChild(opt);
+  });
+  select.value = currentPin === null || currentPin === undefined ? "" : String(currentPin);
+
+  select.addEventListener("change", () => {
+    assignFxPin(segmentIndex, fn, select.value === "" ? null : parseInt(select.value, 10));
+  });
+  wrap.appendChild(select);
+
+  if (eligible.length === 0 && (currentPin === null || currentPin === undefined)) {
+    const hint = document.createElement("span");
+    hint.className = "field-hint";
+    hint.textContent = "No free pins available";
+    wrap.appendChild(hint);
+  }
+  return wrap;
+}
+
+function renderFxRackSegments() {
+  const container = document.getElementById("fxRackSegments");
+  container.innerHTML = "";
+  const live = state.fxRackLive;
+  const entry = selectedEntry();
+  const showLive = !!(entry && entry.entry_type === "device" && entry.connected && live);
+
+  state.fxRack.segments.forEach((seg, i) => {
+    const row = document.createElement("div");
+    row.className = "segment-card";
+    if (showLive && live.enabled[i]) row.classList.add("active");
+
+    const heading = document.createElement("div");
+    heading.className = "segment-card-heading";
+    heading.textContent = `Segment ${i + 1}`;
+    row.appendChild(heading);
+
+    const statusLabel = document.createElement("span");
+    statusLabel.className = "field-hint";
+    statusLabel.textContent = showLive
+      ? live.enabled[i]
+        ? "On (via physical button)"
+        : "Off (via physical button)"
+      : "Connect the device to see live status";
+    row.appendChild(statusLabel);
+
+    row.appendChild(buildFxPinSelect(i, "encoder1", seg.encoder1_pin));
+    row.appendChild(buildFxPinSelect(i, "encoder2", seg.encoder2_pin));
+    row.appendChild(buildFxPinSelect(i, "enable", seg.enable_pin));
+    row.appendChild(buildFxPinSelect(i, "shift", seg.shift_pin));
+    row.appendChild(buildFxPinSelect(i, "on_light", seg.on_light_pin));
+    row.appendChild(buildFxPinSelect(i, "shift_light", seg.shift_light_pin));
+    row.appendChild(buildShiftLinkHint(seg, "encoder1_pin", "shift_pin", "encoder"));
+    row.appendChild(buildShiftLinkHint(seg, "encoder2_pin", "shift_pin", "encoder"));
+
+    container.appendChild(row);
+  });
+}
+
+// ---- joystick: pin assignment + rendering ----------------------------------
+// A single fixed X/Y/rotation + button widget, not a repeatable list. Every
+// pin is an ordinary existing role (pot_cc for the three axes, button_note
+// for the click) -- no engine at all, just a fixed-shape assignment UI plus
+// a monitor visualization fed by the existing pin_activity event stream.
+
+const JOYSTICK_AXIS_LABELS = { x: "X axis", y: "Y axis", z: "Rotation (Z)", button: "Button" };
+
+function joystickEligiblePins(axis) {
+  const currentlyAssigned = state.joystick[axis + "_pin"];
+  const isAnalog = axis === "x" || axis === "y" || axis === "z";
+  const result = [];
+  if (isAnalog) {
+    for (let pin = 54; pin < PIN_COUNT; pin++) {
+      if (pin === currentlyAssigned) {
+        result.push(pin);
+        continue;
+      }
+      if (pinByIndex(pin).role !== "unused") continue;
+      result.push(pin);
+    }
+  } else {
+    for (let pin = 0; pin < 54; pin++) {
+      if (RESERVED_PINS.has(pin)) continue;
+      if (pin === currentlyAssigned) {
+        result.push(pin);
+        continue;
+      }
+      if (pinByIndex(pin).role !== "unused") continue;
+      result.push(pin);
+    }
+  }
+  return result;
+}
+
+function assignJoystickPin(axis, pin) {
+  const field = axis + "_pin";
+  const prevPin = state.joystick[field];
+  if (prevPin !== null && prevPin !== undefined && prevPin !== pin) {
+    clearAssignedPin(prevPin);
+  }
+  state.joystick[field] = pin === null || pin === undefined ? null : pin;
+
+  if (pin !== null && pin !== undefined) {
+    const p = pinByIndex(pin);
+    if (axis === "button") {
+      p.role = "button_note";
+      p.channel = 0;
+      p.number = 60; // default note, freely editable via Table/Board afterward
+    } else {
+      p.role = "pot_cc";
+      p.channel = 0;
+      p.number = axis === "x" ? 20 : axis === "y" ? 21 : 22;
+      p.in_min = 0;
+      p.in_max = 255;
+      p.out_min = 0;
+      p.out_max = 127;
+      p.shift_pin = NO_SHIFT_PIN;
+    }
+  }
+
+  scheduleAutoSave();
+  renderAll();
+}
+
+function buildJoystickPinSelect(axis) {
+  const wrap = document.createElement("div");
+  wrap.className = "field-row";
+  const label = document.createElement("label");
+  label.textContent = JOYSTICK_AXIS_LABELS[axis];
+  wrap.appendChild(label);
+
+  const select = document.createElement("select");
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+  noneOpt.textContent = "Unassigned";
+  select.appendChild(noneOpt);
+
+  const currentPin = state.joystick[axis + "_pin"];
+  const eligible = joystickEligiblePins(axis);
+  eligible.forEach((pin) => {
+    const opt = document.createElement("option");
+    opt.value = String(pin);
+    opt.textContent = `${pinLabel(pin)} (#${pin})`;
+    select.appendChild(opt);
+  });
+  select.value = currentPin === null || currentPin === undefined ? "" : String(currentPin);
+
+  select.addEventListener("change", () => {
+    assignJoystickPin(axis, select.value === "" ? null : parseInt(select.value, 10));
+  });
+  wrap.appendChild(select);
+
+  if (eligible.length === 0 && (currentPin === null || currentPin === undefined)) {
+    const hint = document.createElement("span");
+    hint.className = "field-hint";
+    hint.textContent = "No free pins available";
+    wrap.appendChild(hint);
+  }
+  return wrap;
+}
+
+function renderJoystickTab() {
+  const el = document.getElementById("joystickSettings");
+  el.innerHTML = "";
+
+  const hint = document.createElement("div");
+  hint.className = "field-hint";
+  hint.textContent =
+    "X/Y/rotation are analog pots (A0–A15); the button is a plain digital input. Sends ordinary CC/Note like any other pin — no special engine involved.";
+  el.appendChild(hint);
+
+  ["x", "y", "z", "button"].forEach((axis) => {
+    el.appendChild(buildJoystickPinSelect(axis));
+  });
+
+  const monitor = document.createElement("div");
+  monitor.className = "joystick-monitor";
+  const dot = document.createElement("div");
+  dot.id = "joystickDot";
+  dot.className = "joystick-dot";
+  monitor.appendChild(dot);
+  el.appendChild(monitor);
+
+  const zRow = document.createElement("div");
+  zRow.className = "joystick-zbar-wrap";
+  const zFill = document.createElement("div");
+  zFill.id = "joystickZFill";
+  zFill.className = "joystick-zbar-fill";
+  zRow.appendChild(zFill);
+  el.appendChild(zRow);
+}
+
+function updateJoystickVisual(pin, value) {
+  if (!state.joystick) return;
+  const dot = document.getElementById("joystickDot");
+  const zFill = document.getElementById("joystickZFill");
+  if (dot && pin === state.joystick.x_pin) {
+    dot.dataset.x = value;
+    positionJoystickDot(dot);
+  } else if (dot && pin === state.joystick.y_pin) {
+    dot.dataset.y = value;
+    positionJoystickDot(dot);
+  } else if (zFill && pin === state.joystick.z_pin) {
+    zFill.style.width = `${Math.round((value / 127) * 100)}%`;
+  }
+}
+
+function positionJoystickDot(dot) {
+  const x = dot.dataset.x !== undefined ? parseInt(dot.dataset.x, 10) : 64;
+  const y = dot.dataset.y !== undefined ? parseInt(dot.dataset.y, 10) : 64;
+  dot.style.left = `${Math.round((x / 127) * 100)}%`;
+  dot.style.top = `${Math.round((1 - y / 127) * 100)}%`;
 }
 
 // ---- sidebar ----------------------------------------------------------------
@@ -1505,6 +2385,78 @@ async function refreshEntries() {
   renderHeader();
 }
 
+// ---- feature toggles + tab bar ----------------------------------------------
+// One place to turn Sequencer/Drone/FX Rack/Joystick on or off per entry.
+// Table/Board are always available; the other four tabs only appear in the
+// tab bar while their feature is enabled here.
+
+const TAB_DEFS = [
+  { key: "table", label: "Table", viewId: "tableView", always: true },
+  { key: "board", label: "Board", viewId: "boardView", always: true },
+  { key: "sequencer", label: "Sequencer", viewId: "sequencerView", stateKey: "sequencer" },
+  { key: "drone", label: "Drone", viewId: "droneView", stateKey: "drone" },
+  { key: "fx_rack", label: "FX Rack", viewId: "fxRackView", stateKey: "fxRack" },
+  { key: "joystick", label: "Joystick", viewId: "joystickView", stateKey: "joystick" },
+];
+
+function setFeatureEnabled(stateKey, value) {
+  state[stateKey].enabled = value;
+  scheduleAutoSave();
+  renderAll();
+}
+
+function buildFeatureToggles() {
+  const wrap = document.createElement("div");
+  wrap.className = "feature-toggles";
+  [
+    ["sequencer", "Sequencer"],
+    ["drone", "Drone"],
+    ["fxRack", "FX Rack"],
+    ["joystick", "Joystick"],
+  ].forEach(([stateKey, label]) => {
+    const lbl = document.createElement("label");
+    lbl.className = "checkbox-label feature-toggle";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = !!(state[stateKey] && state[stateKey].enabled);
+    input.addEventListener("change", () => setFeatureEnabled(stateKey, input.checked));
+    const text = document.createElement("span");
+    text.textContent = label;
+    lbl.appendChild(input);
+    lbl.appendChild(text);
+    wrap.appendChild(lbl);
+  });
+  return wrap;
+}
+
+// Rebuilds the tab bar from TAB_DEFS (only showing tabs whose feature is
+// enabled, always showing Table/Board), and syncs each view div's "active"
+// class to state.view. Falls back to "table" if the currently active view's
+// feature just got disabled.
+function renderTabs() {
+  const container = document.getElementById("viewTabs");
+  if (!container) return;
+  const visible = TAB_DEFS.filter((t) => t.always || (state[t.stateKey] && state[t.stateKey].enabled));
+  if (!visible.some((t) => t.key === state.view)) {
+    state.view = "table";
+  }
+  container.innerHTML = "";
+  visible.forEach((def) => {
+    const btn = document.createElement("button");
+    btn.className = "tab" + (state.view === def.key ? " active" : "");
+    btn.textContent = def.label;
+    btn.addEventListener("click", () => {
+      state.view = def.key;
+      renderTabs();
+    });
+    container.appendChild(btn);
+  });
+  TAB_DEFS.forEach((def) => {
+    const el = document.getElementById(def.viewId);
+    if (el) el.classList.toggle("active", state.view === def.key);
+  });
+}
+
 // ---- header (per-entry actions) ---------------------------------------------
 
 function renderHeader() {
@@ -1523,6 +2475,8 @@ function renderHeader() {
   name.className = "eh-name";
   name.textContent = entry.nickname;
   el.appendChild(name);
+
+  el.appendChild(buildFeatureToggles());
 
   const resetBtn = document.createElement("button");
   resetBtn.textContent = "Reset profile";
@@ -1601,13 +2555,21 @@ async function selectEntry(id) {
   state.selectedId = id;
   state.selectedPin = null;
   state.sequencerLive = null;
+  state.droneLive = null;
+  state.fxRackLive = null;
   if (id === ALL_DEVICES_ID) {
     state.pins = [];
-    state.sequencer = { channel: 0, subdivision: "16th", enabled: true, step_control: "encoder", steps: [] };
+    state.sequencer = { channel: 0, subdivision: "16th", enabled: true, steps: [] };
+    state.drone = { enabled: false, channel: 0, segments: [] };
+    state.fxRack = { enabled: false, channel: 0, segments: [] };
+    state.joystick = { enabled: false, x_pin: null, y_pin: null, z_pin: null, button_pin: null };
   } else {
     const dict = await api("get_entry", id);
     state.pins = dict.pins;
     state.sequencer = dict.sequencer;
+    state.drone = dict.drone;
+    state.fxRack = dict.fx_rack;
+    state.joystick = dict.joystick;
   }
   renderAll();
 }
@@ -1623,6 +2585,9 @@ async function readFromDevice() {
   if (state.selectedId === id) {
     state.pins = dict.pins;
     state.sequencer = dict.sequencer;
+    state.drone = dict.drone;
+    state.fxRack = dict.fx_rack;
+    state.joystick = dict.joystick;
     state.selectedPin = null;
     renderAll();
   }
@@ -1631,7 +2596,7 @@ async function readFromDevice() {
 async function resetProfile(id) {
   if (
     !confirm(
-      "Reset this profile? Every pin role and the sequencer setup are cleared back to blank. This cannot be undone (unless you still have it on the device to read back). Are you sure?"
+      "Reset this profile? Every pin role and feature setup (sequencer/drone/FX rack/joystick) are cleared back to blank. This cannot be undone (unless you still have it on the device to read back). Are you sure?"
     )
   )
     return;
@@ -1640,6 +2605,9 @@ async function resetProfile(id) {
   if (state.selectedId === id) {
     state.pins = dict.pins;
     state.sequencer = dict.sequencer;
+    state.drone = dict.drone;
+    state.fxRack = dict.fx_rack;
+    state.joystick = dict.joystick;
     state.selectedPin = null;
     renderAll();
   }
@@ -1752,7 +2720,11 @@ function renderAll() {
     renderBoard();
     renderEditor();
     renderSequencerTab();
+    renderDroneTab();
+    renderFxRackTab();
+    renderJoystickTab();
   }
+  renderTabs();
   renderSidebar();
   renderHeader();
 }
@@ -1768,24 +2740,6 @@ function initEventListeners() {
     state.monitorRows = 0;
   });
 
-  document.querySelectorAll(".tab").forEach((tab) => {
-    tab.addEventListener("click", () => {
-      state.view = tab.dataset.view;
-      document
-        .querySelectorAll(".tab")
-        .forEach((t) => t.classList.toggle("active", t === tab));
-      document
-        .getElementById("tableView")
-        .classList.toggle("active", state.view === "table");
-      document
-        .getElementById("boardView")
-        .classList.toggle("active", state.view === "board");
-      document
-        .getElementById("sequencerView")
-        .classList.toggle("active", state.view === "sequencer");
-    });
-  });
-
   window.addEventListener("monitor_event", (e) => {
     const evt = e.detail;
     if (state.selectedId !== ALL_DEVICES_ID) {
@@ -1798,7 +2752,10 @@ function initEventListeners() {
   window.addEventListener("pin_activity", (e) => {
     const entry = selectedEntry();
     if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
-    e.detail.pins.forEach(({ pin, value }) => flashPin(pin, value));
+    e.detail.pins.forEach(({ pin, value }) => {
+      flashPin(pin, value);
+      updateJoystickVisual(pin, value);
+    });
   });
 
   window.addEventListener("sequencer_state", (e) => {
@@ -1806,6 +2763,20 @@ function initEventListeners() {
     if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
     state.sequencerLive = e.detail;
     renderSequencerSteps();
+  });
+
+  window.addEventListener("drone_state", (e) => {
+    const entry = selectedEntry();
+    if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
+    state.droneLive = e.detail;
+    renderDroneSegments();
+  });
+
+  window.addEventListener("fx_state", (e) => {
+    const entry = selectedEntry();
+    if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
+    state.fxRackLive = e.detail;
+    renderFxRackSegments();
   });
 }
 

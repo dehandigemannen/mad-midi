@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config_model
 import protocol
-import sequencer
 from sequencer import SUBDIVISION_TICKS, SequencerEngine
 
 
@@ -21,9 +20,6 @@ def _make_engine(
     subdivision="16th",
     num_steps=2,
     button_pins=None,
-    encoder_pins=None,
-    pot_pins=None,
-    pwm_pins=None,
     enabled_light_pins=None,
 ):
     steps = []
@@ -31,18 +27,10 @@ def _make_engine(
         step = config_model.SequencerStepConfig(note=60 + i)
         if button_pins and i in button_pins:
             step.button_pin = button_pins[i]
-        if encoder_pins and i in encoder_pins:
-            step.encoder_pin = encoder_pins[i]
-        if pot_pins and i in pot_pins:
-            step.encoder_pin = pot_pins[i]  # same step field, either role can occupy it
-        if pwm_pins and i in pwm_pins:
-            step.pwm_pin = pwm_pins[i]
         if enabled_light_pins and i in enabled_light_pins:
             step.enabled_light_pin = enabled_light_pins[i]
         steps.append(step)
-    config = config_model.SequencerConfig(
-        channel=9, subdivision=subdivision, step_control="pot" if pot_pins else "encoder", steps=steps
-    )
+    config = config_model.SequencerConfig(channel=9, subdivision=subdivision, steps=steps)
 
     pins = [config_model.PinConfig(pin=i) for i in range(protocol.PIN_COUNT)]
     for i, pin_index in (button_pins or {}).items():
@@ -50,20 +38,6 @@ def _make_engine(
         pins[pin_index].toggle = False  # latching switch: level mode, not edge-toggled
         pins[pin_index].channel = 9
         pins[pin_index].number = 100 + i
-    for i, pin_index in (encoder_pins or {}).items():
-        pins[pin_index].role = "encoder_a"
-        pins[pin_index].channel = 9
-        pins[pin_index].number = 50 + i
-        pins[pin_index].in_min = protocol.NO_SHIFT_PIN
-    for i, pin_index in (pot_pins or {}).items():
-        pins[pin_index].role = "pot_cc"
-        pins[pin_index].channel = 9
-        pins[pin_index].number = 50 + i
-        pins[pin_index].shift_pin = protocol.NO_SHIFT_PIN
-    for i, pin_index in (pwm_pins or {}).items():
-        pins[pin_index].role = "light_pwm"
-        pins[pin_index].channel = 9
-        pins[pin_index].number = 70 + i
     for i, pin_index in (enabled_light_pins or {}).items():
         pins[pin_index].role = "light_digital"
         pins[pin_index].channel = 9
@@ -170,54 +144,6 @@ def test_incoming_button_message_sets_step_from_level_and_is_consumed():
     assert not_consumed is False, "an unrelated message must be forwarded normally"
 
 
-def test_encoder_turn_accumulates_into_pwm_and_is_not_consumed():
-    # The encoder only ever reports a relative click (1 = CW, 127 = CCW),
-    # never an absolute position, so the PWM meter has to accumulate its
-    # own running value rather than mirror the raw click straight through
-    # (which would barely light up on a CW click and nearly max out on a
-    # single CCW one) -- see sequencer.py's PWM_METER_START/STEP.
-    engine, _daw_messages, device_messages, _states = _make_engine(
-        subdivision="16th", num_steps=1, encoder_pins={0: 10}, pwm_pins={0: 6}
-    )
-    consumed = engine.handle_incoming_pin_message(channel=9, number=50, value=1)  # CW click
-    assert consumed is False, "an encoder turn must still reach the DAW, not be suppressed"
-    assert len(device_messages) == 1, "the PWM pin should have been driven from the accumulated value"
-    status, number, value = device_messages[0]
-    assert status == 0xB0 | 9
-    assert number == 70  # this step's configured PWM CC number
-    assert value == sequencer.PWM_METER_START + sequencer.PWM_METER_STEP
-
-    consumed = engine.handle_incoming_pin_message(channel=9, number=50, value=127)  # CCW click
-    assert consumed is False
-    assert device_messages[-1][2] == sequencer.PWM_METER_START, "a CCW click should move it back down"
-
-
-def test_accelerated_encoder_turn_scales_pwm_by_magnitude():
-    # FLAG_ACCEL_ENABLE turns can send any magnitude 1..63 (CW) / 65..127
-    # (CCW), not just the plain 1/127 -- the PWM meter must scale by that
-    # magnitude too, not treat every non-1 value as a single CCW click.
-    engine, _daw_messages, device_messages, _states = _make_engine(
-        subdivision="16th", num_steps=1, encoder_pins={0: 10}, pwm_pins={0: 6}
-    )
-    engine.handle_incoming_pin_message(channel=9, number=50, value=5)  # accelerated CW
-    assert device_messages[-1][2] == sequencer.PWM_METER_START + sequencer.PWM_METER_STEP * 5
-
-    engine.handle_incoming_pin_message(channel=9, number=50, value=123)  # accelerated CCW (magnitude 5)
-    assert device_messages[-1][2] == sequencer.PWM_METER_START
-
-
-def test_pot_value_mirrors_directly_into_pwm_and_is_not_consumed():
-    # A pot reports its actual absolute position, unlike an encoder's
-    # relative clicks -- the PWM meter must mirror it directly, not
-    # accumulate.
-    engine, _daw_messages, device_messages, _states = _make_engine(
-        subdivision="16th", num_steps=1, pot_pins={0: 54}, pwm_pins={0: 6}
-    )
-    consumed = engine.handle_incoming_pin_message(channel=9, number=50, value=90)
-    assert consumed is False, "a pot move must still reach the DAW, not be suppressed"
-    assert device_messages[-1][2] == 90
-
-
 def test_enabled_light_tracks_step_on_off_state():
     # enabled_light is a persistent on/off indicator, distinct from
     # step_light (which only flashes on trigger) -- it must follow
@@ -236,19 +162,6 @@ def test_enabled_light_tracks_step_on_off_state():
 
     engine.handle_incoming_pin_message(channel=9, number=100, value=127)  # step 0's button, pressed
     assert tuple(device_messages[-1]) == (0xB0 | 9, 90, 127)
-
-
-def test_pwm_accumulator_clamps_at_bounds():
-    engine, _daw_messages, device_messages, _states = _make_engine(
-        subdivision="16th", num_steps=1, encoder_pins={0: 10}, pwm_pins={0: 6}
-    )
-    for _ in range(100):
-        engine.handle_incoming_pin_message(channel=9, number=50, value=1)  # CW click
-    assert device_messages[-1][2] == 127, "must clamp at the top instead of wrapping/overflowing"
-
-    for _ in range(100):
-        engine.handle_incoming_pin_message(channel=9, number=50, value=127)  # CCW click
-    assert device_messages[-1][2] == 0, "must clamp at the bottom instead of wrapping/underflowing"
 
 
 if __name__ == "__main__":

@@ -188,18 +188,24 @@ pin list) rather than introducing a parallel config surface.
   separate control), a value control (live CC while the step plays), a
   shift button (the value control's alternate CC, same shift-group
   mechanism as regular encoders/pots), a PWM pin (mirrors the value
-  control's current value as a brightness/VU meter), and a step light
-  (flashed for the gate duration while the step plays).
-- **Step value control type** (`SequencerConfig.step_control`, `"encoder"`
-  | `"pot"`, default `"encoder"`): one global choice per entry for what
-  role every step's value-control pin gets assigned — `assignSequencerPin`
-  in app.js wires it to either ENCODER_A (2 digital pins, relative CC) or
-  POT_CC (1 analog pin, absolute CC) accordingly, including the shift-group
-  linkage either role needs. Switching it doesn't retroactively move
-  already-assigned pins — each step's pin has to be reassigned afterward.
-  `SequencerEngine` also branches on this per-step (`_ResolvedStep.is_pot`)
-  since a pot's incoming CC is an absolute value to mirror straight onto
-  the PWM meter, not a relative click to accumulate like an encoder's.
+  control's current value as a brightness/VU meter — see **Value mirror**
+  below, which now drives this instead of the sequencer engine itself),
+  and a step light (flashed for the gate duration while the step plays).
+- **Step value control type** (`SequencerStepConfig.control_type`,
+  `"encoder"` | `"pot"`, default `"encoder"`): each step independently
+  chooses what role its own value-control pin gets assigned — a "Value
+  control" dropdown right in that step's row, not a device-wide setting —
+  so one step can use an encoder while another uses a pot on the same
+  entry. `assignSequencerPin` in app.js wires it to either ENCODER_A (2
+  digital pins, relative CC) or POT_CC (1 analog pin, absolute CC)
+  accordingly, including the shift-group linkage either role needs.
+  Switching it doesn't retroactively move an already-assigned pin — it has
+  to be reassigned afterward. The engine itself never branches on this
+  setting: `value_mirror.ValueMirrorEngine` (see **Value mirror** below)
+  derives encoder-vs-pot behavior straight from the pin's actual role at
+  resolve time, so a step's PWM meter already mirrors a pot's absolute CC
+  directly and accumulates an encoder's relative clicks with no
+  step-level configuration needed for that part.
 - **Runtime vs. persisted state**: step count, subdivision, channel,
   per-step notes, and pin assignments are part of the entry and
   auto-saved to its JSON file. The on/off pattern and playback position
@@ -208,18 +214,110 @@ pin list) rather than introducing a parallel config surface.
   disabled.
 - **Message flow**: a step's button press arrives from the device like any
   other pin message; `DeviceSession._on_device_midi` gives the sequencer
-  first look, and only messages it doesn't recognize as a sequencer input
+  first look (after the value-mirror engine, which never consumes
+  anything), and only messages it doesn't recognize as a sequencer input
   are forwarded on to the DAW. A triggered step's Note On/Off goes
-  straight to the DAW via the bridge; step-light and PWM-meter updates go
-  the other direction, straight to the device, using the same synthetic
-  CC messages the firmware already expects for `LIGHT_DIGITAL`/`LIGHT_PWM`
-  pins.
+  straight to the DAW via the bridge; step-light updates go the other
+  direction, straight to the device, using the same synthetic CC messages
+  the firmware already expects for `LIGHT_DIGITAL`/`LIGHT_PWM` pins.
 - **UI**: a dedicated **Sequencer** tab per entry, separate from the
   Table/Board pin views, showing global settings (step count, subdivision,
   channel) and one row per step for its note and pin assignments; live
   step/enabled state streams into the UI while connected and running, and
   a step can also be toggled from the UI itself as a software fallback
   when no physical button is wired up.
+
+## Value mirror (VU meter, any encoder/pot)
+
+An app-side "mirror this control's live value onto a PWM pin's brightness"
+mechanism, generalized out of what used to be sequencer-only logic
+(`app/value_mirror.py`) so it works for **any** `encoder_a`/`pot_cc` pin —
+part of a plain Table/Board mapping, a Sequencer step, a Drone segment, or
+nothing composite at all.
+
+- **`PinConfig.mirror_pin`** (`config_model.py`): app-only field on an
+  `encoder_a`/`pot_cc` pin naming the `light_pwm` pin whose brightness
+  should track it. Deliberately excluded from `to_tuple()`/`from_tuple()`
+  (never part of the EEPROM blob) — the firmware has no idea this is
+  happening, exactly like the original sequencer trick: it's just an
+  ordinary CC arriving that happens to match a `light_pwm`+`match_cc` pin.
+- **Accumulation**: an encoder only ever reports a relative click (1=CW,
+  127=CCW, scaled by `FLAG_ACCEL_ENABLE`'s magnitude), never an absolute
+  position, so `ValueMirrorEngine` keeps its own running value per mirrored
+  control (seeded mid-brightness, clamped 0-127). A pot reports its actual
+  absolute position, so it's mirrored directly with no accumulation.
+- **Always active**: built unconditionally per `DeviceSession` (not gated
+  by any feature's `enabled` flag), so a step/segment's meter — or a bare
+  Table/Board encoder's — keeps updating even while its owning feature is
+  disabled.
+- **UI**: a "Mirror value to PWM pin (VU meter)" picker in the Table/Board
+  editor panel for any `encoder_a`/`pot_cc` pin; Sequencer/Drone's own
+  "PWM" pin-picker is sugar over the same field (assigning it sets the
+  paired control pin's `mirror_pin` automatically).
+
+## Drone
+
+1-8 app-only "drone" segments per entry (`config_model.DroneConfig`/
+`DroneSegmentConfig`), reusing the same pin-borrowing pattern as the
+Sequencer. A drone **never sends a Note** — it's a value control whose CC
+output is gated on/off by an enable button.
+
+- **Segment shape**: one value control (encoder or pot, `control_type`
+  chosen independently per segment — same "Value control" dropdown pattern
+  as the Sequencer's per-step choice, not a device-wide setting), one
+  enable button (`button_cc`+toggle), one shift button, one PWM meter (via
+  `mirror_pin`), and two indicator lights (on-state, shift-held).
+- **Gating** (`app/gated_segments.py`'s `GatedSegmentEngine`, shared with FX
+  Rack): the enable button's own CC never reaches the DAW; while its
+  segment is disabled, the control pin's CC is suppressed too; while
+  enabled, it passes straight through untouched. No note/trigger logic at
+  all — thinner than the Sequencer engine.
+- **Lights need zero engine code**: both the on-light and shift-light are
+  wired via `PinConfig.listen_pin` straight at the enable/shift pin —
+  firmware's `applyListenLights()` already mirrors a toggle button's
+  *logical* on/off state (not just raw press/release), so this works with
+  no MIDI round-trip and no app polling.
+- **Enable is hardware-only**: unlike the Sequencer's step-enabled state
+  (which the app can also toggle via a synthetic CC + software checkbox),
+  a drone segment's on/off state lives in the firmware's real button
+  `toggleState`, which the app has no protocol command to set remotely —
+  so the Drone tab shows live enabled state as a read-only indicator
+  (`drone_state` push event), not a clickable checkbox.
+- **No firmware/wire-protocol changes**: every mechanism above reuses
+  existing roles/flags/fields verbatim.
+
+## FX Rack
+
+1-8 app-only FX segments per entry (`config_model.FxRackConfig`/
+`FxSegmentConfig`). Each segment is always **two encoders** (never pots) +
+one enable button gating both at once + one shared shift button + the same
+on/shift lights as Drone — no PWM meter.
+
+- Reuses `GatedSegmentEngine` directly (`app/fx_rack.py`) with two value
+  pins per segment instead of Drone's one — the only difference in shape.
+- Both encoders share the same shift button, each with its own shifted CC
+  destination so they don't collide.
+
+## Joystick
+
+A single (non-repeatable) X/Y/rotation + button widget per entry
+(`config_model.JoystickConfig`). Every pin is an ordinary existing role —
+three `pot_cc` pins for the axes (rotation is just a third pot, wired to a
+twist mechanism) and one `button_note`/`button_cc` pin for the click. No
+new `PinRole`, no engine at all: all four pins flow through the normal
+pin-role dispatch like any other input. The Joystick tab includes a small
+XY-dot + Z-bar visualization fed by the existing `pin_activity` event
+stream (the same one Table/Board's per-pin activity dots use).
+
+## Feature toggles
+
+Sequencer/Drone/FX Rack/Joystick each have their own `enabled` flag
+(`SequencerConfig`/`DroneConfig`/`FxRackConfig`/`JoystickConfig`), surfaced
+as a row of checkboxes in the entry header (`app.js`'s
+`buildFeatureToggles()`) rather than buried inside each tab. The tab bar
+itself is built from a small `TAB_DEFS` registry: Table/Board always show;
+the other four only appear while their feature is enabled, and switching a
+feature off while its tab is active falls back to Table.
 
 ## Multi-device support
 
@@ -268,12 +366,21 @@ mad-midi/
       midi_io.h / .cpp         MIDI byte encode/decode over Serial
       roles.h / .cpp           per-pin role handlers (buttons, lights, encoders, pots)
   app/                         Python app (run from source)
-    main.py                    entrypoint, pywebview window + JS bridge API
+    main.py                    entrypoint only: creates the Api and the pywebview window
+    api.py                     Api class exposed to the UI as window.pywebview.api (entries,
+                               device adoption/reconnect, config read/write, flashing, auto-reconnect poller)
+    device_session.py          DeviceSession (one per connected device: serial link + MIDI bridge +
+                               sequencer/drone/fx_rack/value-mirror engines) plus the small helpers
+                               only a session needs (virtual port naming, monitor decoding, pin matching)
     protocol.py                same wire-protocol constants as firmware (source of truth kept in sync manually)
     serial_link.py             pyserial connection, background reader, mode transitions
-    config_model.py            PinConfig/Preset dataclasses, JSON <-> binary blob (de)serialization
+    config_model.py            PinConfig/Entry + per-feature config dataclasses, JSON <-> binary blob (de)serialization
     midi_bridge.py             python-rtmidi virtual port, decode/encode MIDI messages
-    sequencer.py               app-only step sequencer engine, slaved to MIDI clock (see Sequencer below)
+    sequencer.py               app-only step sequencer engine, slaved to MIDI clock (see Sequencer above)
+    value_mirror.py            generalized encoder/pot -> PWM VU-meter engine (see Value mirror above)
+    gated_segments.py          shared enable-button-gates-value-pins engine behind Drone and FX Rack
+    drone.py                   app-only drone engine (thin wrapper over gated_segments, see Drone above)
+    fx_rack.py                 app-only FX rack engine (thin wrapper over gated_segments, see FX Rack above)
     flasher.py                 subprocess wrapper around bundled avrdude
     ui/
       index.html
@@ -281,6 +388,8 @@ mad-midi/
       style.css
     vendor/avrdude/darwin/     bundled avrdude binary + avrdude.conf
     devices/                   one auto-saved *.json per sidebar entry (device or draft)
+    tests/                     plain assert-based checks, no test framework installed
+                               (run with `python3 app/tests/test_<name>.py`)
   requirements.txt
 ```
 
@@ -298,6 +407,11 @@ mad-midi/
 - App-only step sequencer per device entry, slaved to external MIDI clock,
   driving pins already assigned in that entry's pin map (see Sequencer
   above).
+- Generalized value-mirror (VU meter) for any encoder/pot pin, plus Drone
+  (1-8 gated value-control segments), FX Rack (1-8 dual-encoder segments),
+  and Joystick (X/Y/rotation + button) — each independently toggleable per
+  entry (see Value mirror / Drone / FX Rack / Joystick / Feature toggles
+  above). None of these need firmware or wire-protocol changes.
 - Unified MIDI monitor: decoded + raw bytes, tagged MIDI vs CTRL.
 - A sidebar of devices (adopted, persistent, offline-editable) and drafts
   (configs not yet tied to hardware, applicable to any adopted device).

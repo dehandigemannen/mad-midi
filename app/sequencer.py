@@ -15,6 +15,11 @@ CC/Note the firmware already treats as "light_digital"/"light_pwm" input
 DAW exactly like any other device-originated MIDI message. Each step's
 enabled_light pin is driven the same way, but tracks the step's on/off
 state rather than flashing on trigger.
+
+A step's PWM value-meter (mirroring its value control's live CC output) is
+no longer this engine's concern -- see value_mirror.ValueMirrorEngine, which
+generalizes that trick to any encoder_a/pot_cc pin via PinConfig.mirror_pin,
+not just a sequencer step's.
 """
 
 import threading
@@ -22,7 +27,6 @@ import time
 from typing import Callable, List, Optional, Tuple
 
 import config_model
-import protocol
 
 TICKS_PER_QUARTER = 24  # MIDI clock standard: 24 clock messages per quarter note
 SUBDIVISION_TICKS = {
@@ -35,8 +39,6 @@ DEFAULT_TICKS_PER_STEP = SUBDIVISION_TICKS["16th"]
 GATE_FRACTION = 0.5  # Note On lasts this fraction of one step's duration
 DEFAULT_VELOCITY = 100
 FALLBACK_TICK_INTERVAL_S = 60.0 / 120 / TICKS_PER_QUARTER  # seed at ~120bpm until clock arrives
-PWM_METER_START = 64  # start each meter at mid-brightness so both turn directions are visible right away
-PWM_METER_STEP = 3  # brightness change per detent -- ~a third of a full turn (42 clicks) sweeps 0-127
 
 SendBytes = Callable[[bytes], None]
 StateCallback = Callable[[dict], None]
@@ -50,28 +52,7 @@ class _ResolvedStep:
         self.note = step.note
         self.button = _resolve(pins, step.button_pin)
         self.step_light = _resolve(pins, step.step_light_pin)
-        self.pwm = _resolve(pins, step.pwm_pin)
         self.enabled_light = _resolve(pins, step.enabled_light_pin)
-
-        # The PWM meter mirrors whichever CC the step's value control (an
-        # encoder or, if step_control is "pot", a pot) is currently sending —
-        # plain or, if a shift group is configured, shifted too. Pots use
-        # dedicated shift_pin/shift_channel/shift_number fields instead of
-        # encoder_a's in_min/out_min/out_max repurposing, since pots need
-        # in_min/in_max/out_min/out_max for their own ADC->CC scaling (see
-        # pin_config.h).
-        self.encoder_plain: Optional[Tuple[int, int]] = None
-        self.encoder_shifted: Optional[Tuple[int, int]] = None
-        self.is_pot = False
-        if step.encoder_pin is not None and 0 <= step.encoder_pin < len(pins):
-            enc = pins[step.encoder_pin]
-            self.encoder_plain = (enc.channel, enc.number)
-            self.is_pot = enc.role == "pot_cc"
-            if self.is_pot:
-                if enc.shift_pin != protocol.NO_SHIFT_PIN:
-                    self.encoder_shifted = (enc.shift_channel, enc.shift_number)
-            elif enc.in_min != protocol.NO_SHIFT_PIN:
-                self.encoder_shifted = (enc.out_min, enc.out_max)
 
 
 def _resolve(pins: List[config_model.PinConfig], pin_index: Optional[int]) -> Optional[Tuple[int, int]]:
@@ -106,17 +87,6 @@ class SequencerEngine:
         self._avg_tick_interval = FALLBACK_TICK_INTERVAL_S
         self._off_timers: List[Optional[threading.Timer]] = [None] * len(self._steps)
         self._lock = threading.Lock()
-
-        # The encoder only ever reports a relative click (CC 1 = one step
-        # CW, 127 = one step CCW) -- there's no such thing as "its current
-        # absolute value" to read back, from the device or from a DAW (a
-        # generic MIDI-mapped CC in a DAW is one-way; getting real value
-        # feedback would mean writing a DAW-specific control-surface
-        # integration). So the pwm meter's brightness is our own running
-        # position, accumulated click-by-click here rather than mirroring
-        # the raw relative value directly (which would barely light up on
-        # a CW click and nearly max out on a single CCW one).
-        self._pwm_value = [PWM_METER_START] * len(self._steps)
 
     # ---- transport -----------------------------------------------------
 
@@ -192,9 +162,7 @@ class SequencerEngine:
     def handle_incoming_pin_message(self, channel: int, number: int, value: int) -> bool:
         """Called for every MIDI message arriving from the device. Returns
         True if it was a sequencer step's button (consumed — caller must not
-        forward it to the DAW), False otherwise (including an encoder match,
-        which still needs to reach the DAW — it's only observed here to
-        mirror its value onto the step's PWM meter)."""
+        forward it to the DAW), False otherwise."""
         for index, step in enumerate(self._steps):
             if step.button == (channel, number):
                 # The button is a latching switch wired for level (not
@@ -204,25 +172,6 @@ class SequencerEngine:
                 # edge (e.g. a session reconnect while it sits mid-position).
                 self.set_step_enabled(index, value != 0)
                 return True
-            if step.pwm is not None and (step.encoder_plain == (channel, number) or step.encoder_shifted == (channel, number)):
-                if step.is_pot:
-                    # A pot reports its actual absolute position directly --
-                    # just mirror it, no accumulation needed.
-                    self._pwm_value[index] = value
-                else:
-                    # value is a relative click -- 1..63 = CW, 65..127 = CCW
-                    # (two's-complement magnitude; see ENCODER_A/
-                    # FLAG_ACCEL_ENABLE in firmware/src/roles.cpp), not an
-                    # absolute position, so accumulate it into one here
-                    # instead of forwarding it as-is. The magnitude scales
-                    # the step so a fast (accelerated) turn moves the meter
-                    # further, same as it moves the real mapped parameter.
-                    if value <= 63:
-                        delta = PWM_METER_STEP * value
-                    else:
-                        delta = -PWM_METER_STEP * (128 - value)
-                    self._pwm_value[index] = max(0, min(127, self._pwm_value[index] + delta))
-                self._send_cc(step.pwm, self._pwm_value[index])
         return False
 
     def set_step_enabled(self, index: int, enabled: bool) -> None:
