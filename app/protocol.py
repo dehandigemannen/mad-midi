@@ -6,13 +6,13 @@ no code generation between the two right now.
 import struct
 
 PIN_COUNT = 70  # Mega: 0-53 digital, 54-69 = A0-A15
-CONFIG_FORMAT_VERSION = 4  # bumped: FLAG_ACCEL_ENABLE added
-RECORD_SIZE = 8
+CONFIG_FORMAT_VERSION = 6  # bumped: PinConfig grew listen_pin (LIGHT_DIGITAL/LIGHT_PWM direct-button-listen support)
+RECORD_SIZE = 12
 HEADER_SIZE = 6  # magic(2) + version(1) + pinCount(1) + deviceId(1) + checksum(1)
 BLOB_SIZE = HEADER_SIZE + PIN_COUNT * RECORD_SIZE
 
 RESERVED_PINS = {0, 1, 13}  # USB Serial0 RX/TX, status LED
-NO_SHIFT_PIN = 255  # ENCODER_A in_min sentinel: no shift button assigned
+NO_SHIFT_PIN = 255  # ENCODER_A in_min / POT_CC shift_pin / light listen_pin sentinel: no pin assigned
 
 # --- PinRole ---------------------------------------------------------------
 
@@ -161,12 +161,14 @@ class RunningStatusMidiParser:
 
 # --- EEPROM config blob (de)serialization -----------------------------------
 
-def pack_pin_config(role, channel, number, in_min, in_max, out_min, out_max, flags) -> bytes:
-    return struct.pack("<8B", role, channel, number, in_min, in_max, out_min, out_max, flags)
+def pack_pin_config(role, channel, number, in_min, in_max, out_min, out_max, flags,
+                     shift_pin, shift_channel, shift_number, listen_pin) -> bytes:
+    return struct.pack("<12B", role, channel, number, in_min, in_max, out_min, out_max, flags,
+                        shift_pin, shift_channel, shift_number, listen_pin)
 
 
 def unpack_pin_config(data: bytes):
-    return struct.unpack("<8B", data)
+    return struct.unpack("<12B", data)
 
 
 def build_config_blob(pins, device_id: int = 0) -> bytes:

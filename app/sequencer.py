@@ -53,14 +53,24 @@ class _ResolvedStep:
         self.pwm = _resolve(pins, step.pwm_pin)
         self.enabled_light = _resolve(pins, step.enabled_light_pin)
 
-        # The PWM meter mirrors whichever CC the encoder is currently
-        # sending — plain or, if a shift group is configured, shifted too.
+        # The PWM meter mirrors whichever CC the step's value control (an
+        # encoder or, if step_control is "pot", a pot) is currently sending —
+        # plain or, if a shift group is configured, shifted too. Pots use
+        # dedicated shift_pin/shift_channel/shift_number fields instead of
+        # encoder_a's in_min/out_min/out_max repurposing, since pots need
+        # in_min/in_max/out_min/out_max for their own ADC->CC scaling (see
+        # pin_config.h).
         self.encoder_plain: Optional[Tuple[int, int]] = None
         self.encoder_shifted: Optional[Tuple[int, int]] = None
+        self.is_pot = False
         if step.encoder_pin is not None and 0 <= step.encoder_pin < len(pins):
             enc = pins[step.encoder_pin]
             self.encoder_plain = (enc.channel, enc.number)
-            if enc.in_min != protocol.NO_SHIFT_PIN:
+            self.is_pot = enc.role == "pot_cc"
+            if self.is_pot:
+                if enc.shift_pin != protocol.NO_SHIFT_PIN:
+                    self.encoder_shifted = (enc.shift_channel, enc.shift_number)
+            elif enc.in_min != protocol.NO_SHIFT_PIN:
                 self.encoder_shifted = (enc.out_min, enc.out_max)
 
 
@@ -195,12 +205,23 @@ class SequencerEngine:
                 self.set_step_enabled(index, value != 0)
                 return True
             if step.pwm is not None and (step.encoder_plain == (channel, number) or step.encoder_shifted == (channel, number)):
-                # value is a relative click (1 = CW, 127 = CCW, see
-                # ENCODER_A in firmware/src/roles.cpp), not an absolute
-                # position -- accumulate it into one here instead of
-                # forwarding it as-is.
-                delta = PWM_METER_STEP if value == 1 else -PWM_METER_STEP
-                self._pwm_value[index] = max(0, min(127, self._pwm_value[index] + delta))
+                if step.is_pot:
+                    # A pot reports its actual absolute position directly --
+                    # just mirror it, no accumulation needed.
+                    self._pwm_value[index] = value
+                else:
+                    # value is a relative click -- 1..63 = CW, 65..127 = CCW
+                    # (two's-complement magnitude; see ENCODER_A/
+                    # FLAG_ACCEL_ENABLE in firmware/src/roles.cpp), not an
+                    # absolute position, so accumulate it into one here
+                    # instead of forwarding it as-is. The magnitude scales
+                    # the step so a fast (accelerated) turn moves the meter
+                    # further, same as it moves the real mapped parameter.
+                    if value <= 63:
+                        delta = PWM_METER_STEP * value
+                    else:
+                        delta = -PWM_METER_STEP * (128 - value)
+                    self._pwm_value[index] = max(0, min(127, self._pwm_value[index] + delta))
                 self._send_cc(step.pwm, self._pwm_value[index])
         return False
 

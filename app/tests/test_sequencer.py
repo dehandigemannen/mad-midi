@@ -22,6 +22,7 @@ def _make_engine(
     num_steps=2,
     button_pins=None,
     encoder_pins=None,
+    pot_pins=None,
     pwm_pins=None,
     enabled_light_pins=None,
 ):
@@ -32,12 +33,16 @@ def _make_engine(
             step.button_pin = button_pins[i]
         if encoder_pins and i in encoder_pins:
             step.encoder_pin = encoder_pins[i]
+        if pot_pins and i in pot_pins:
+            step.encoder_pin = pot_pins[i]  # same step field, either role can occupy it
         if pwm_pins and i in pwm_pins:
             step.pwm_pin = pwm_pins[i]
         if enabled_light_pins and i in enabled_light_pins:
             step.enabled_light_pin = enabled_light_pins[i]
         steps.append(step)
-    config = config_model.SequencerConfig(channel=9, subdivision=subdivision, steps=steps)
+    config = config_model.SequencerConfig(
+        channel=9, subdivision=subdivision, step_control="pot" if pot_pins else "encoder", steps=steps
+    )
 
     pins = [config_model.PinConfig(pin=i) for i in range(protocol.PIN_COUNT)]
     for i, pin_index in (button_pins or {}).items():
@@ -50,6 +55,11 @@ def _make_engine(
         pins[pin_index].channel = 9
         pins[pin_index].number = 50 + i
         pins[pin_index].in_min = protocol.NO_SHIFT_PIN
+    for i, pin_index in (pot_pins or {}).items():
+        pins[pin_index].role = "pot_cc"
+        pins[pin_index].channel = 9
+        pins[pin_index].number = 50 + i
+        pins[pin_index].shift_pin = protocol.NO_SHIFT_PIN
     for i, pin_index in (pwm_pins or {}).items():
         pins[pin_index].role = "light_pwm"
         pins[pin_index].channel = 9
@@ -180,6 +190,32 @@ def test_encoder_turn_accumulates_into_pwm_and_is_not_consumed():
     consumed = engine.handle_incoming_pin_message(channel=9, number=50, value=127)  # CCW click
     assert consumed is False
     assert device_messages[-1][2] == sequencer.PWM_METER_START, "a CCW click should move it back down"
+
+
+def test_accelerated_encoder_turn_scales_pwm_by_magnitude():
+    # FLAG_ACCEL_ENABLE turns can send any magnitude 1..63 (CW) / 65..127
+    # (CCW), not just the plain 1/127 -- the PWM meter must scale by that
+    # magnitude too, not treat every non-1 value as a single CCW click.
+    engine, _daw_messages, device_messages, _states = _make_engine(
+        subdivision="16th", num_steps=1, encoder_pins={0: 10}, pwm_pins={0: 6}
+    )
+    engine.handle_incoming_pin_message(channel=9, number=50, value=5)  # accelerated CW
+    assert device_messages[-1][2] == sequencer.PWM_METER_START + sequencer.PWM_METER_STEP * 5
+
+    engine.handle_incoming_pin_message(channel=9, number=50, value=123)  # accelerated CCW (magnitude 5)
+    assert device_messages[-1][2] == sequencer.PWM_METER_START
+
+
+def test_pot_value_mirrors_directly_into_pwm_and_is_not_consumed():
+    # A pot reports its actual absolute position, unlike an encoder's
+    # relative clicks -- the PWM meter must mirror it directly, not
+    # accumulate.
+    engine, _daw_messages, device_messages, _states = _make_engine(
+        subdivision="16th", num_steps=1, pot_pins={0: 54}, pwm_pins={0: 6}
+    )
+    consumed = engine.handle_incoming_pin_message(channel=9, number=50, value=90)
+    assert consumed is False, "a pot move must still reach the DAW, not be suppressed"
+    assert device_messages[-1][2] == 90
 
 
 def test_enabled_light_tracks_step_on_off_state():

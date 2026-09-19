@@ -6,11 +6,15 @@
 
 static const unsigned long DEBOUNCE_MS = 10;
 
+static void applyToOutputPin(uint8_t pin, uint16_t value, uint16_t inMin, uint16_t inMax);
+static void applyListenLights(uint8_t sourcePin, bool pressed);
+
 static uint8_t rawStable[PIN_COUNT];
 static uint8_t lastRawLevel[PIN_COUNT];
 static uint16_t lastChangeMs[PIN_COUNT];
 static uint8_t toggleState[PIN_COUNT];
 static int16_t potLastSent[PIN_COUNT];
+static bool potLastShifted[PIN_COUNT];
 static volatile int8_t encoderAccum[PIN_COUNT];
 static volatile uint8_t encoderPrevState[PIN_COUNT];
 
@@ -149,6 +153,7 @@ void rolesInit()
   memset(lastRawLevel, 0, sizeof(lastRawLevel));
   memset(lastChangeMs, 0, sizeof(lastChangeMs));
   memset(toggleState, 0, sizeof(toggleState));
+  memset(potLastShifted, 0, sizeof(potLastShifted));
   for (uint8_t i = 0; i < PIN_COUNT; i++)
     potLastSent[i] = -1;
 
@@ -198,6 +203,26 @@ void rolesInit()
   OCR1C = 128;
   TIMSK1 |= (1 << OCIE1C);
   interrupts();
+
+  // Sync any listen-mode lights to their button's actual current state right
+  // away, rather than leaving them dark until the next physical edge.
+  for (uint8_t pin = 0; pin < PIN_COUNT; pin++)
+  {
+    if (isPinReserved(pin))
+      continue;
+    uint8_t role = pinConfigs[pin].role;
+    if (role != ROLE_BUTTON_NOTE && role != ROLE_BUTTON_CC && role != ROLE_BUTTON_SHIFT)
+      continue;
+    const PinConfig &c = pinConfigs[pin];
+    // A toggle CC button's logical state is toggleState (just reset to 0
+    // above, same as its CC output at boot), not the switch's raw position.
+    bool on;
+    if (role == ROLE_BUTTON_CC && (c.flags & FLAG_TOGGLE))
+      on = toggleState[pin] != 0;
+    else
+      on = (c.flags & FLAG_INVERT) ? (rawStable[pin] == HIGH) : (rawStable[pin] == LOW);
+    applyListenLights(pin, on);
+  }
 }
 
 void rolesReconfigure()
@@ -213,6 +238,7 @@ static void handleButtonEdge(uint8_t pin, uint8_t stableLevel)
 
   if (c.role == ROLE_BUTTON_NOTE)
   {
+    applyListenLights(pin, pressed);
     if (pressed)
       midiSendNoteOn(c.channel, c.number, 127);
     else
@@ -222,15 +248,20 @@ static void handleButtonEdge(uint8_t pin, uint8_t stableLevel)
   {
     if (c.flags & FLAG_TOGGLE)
     {
+      // Toggle mode only changes state on the press edge -- a listening
+      // light must mirror that same latched value, not the raw (momentary)
+      // press/release, or it'd go dark the instant the button is released.
       if (pressed)
       {
         toggleState[pin] = toggleState[pin] ? 0 : 127;
         midiSendCC(c.channel, c.number, toggleState[pin]);
+        applyListenLights(pin, toggleState[pin] != 0);
       }
     }
     else
     {
       midiSendCC(c.channel, c.number, pressed ? 127 : 0);
+      applyListenLights(pin, pressed);
     }
   }
 }
@@ -287,8 +318,11 @@ static void scanButtonsAndEncoders()
     }
     else if (role == ROLE_BUTTON_SHIFT)
     {
-      // Pure modifier: track debounced state only, no MIDI of its own.
-      debounce(pin, nowMs);
+      // Pure modifier: track debounced state only, no MIDI of its own --
+      // but a LIGHT_DIGITAL/LIGHT_PWM pin can still listen to it directly
+      // via listenPin (see applyListenLights()).
+      if (debounce(pin, nowMs))
+        applyListenLights(pin, isShiftPinActive(pin));
     }
     else if (role == ROLE_ENCODER_A)
     {
@@ -355,10 +389,20 @@ static void scanPots()
     if (c.flags & FLAG_INVERT)
       mapped = (long)c.outMax + c.outMin - mapped;
 
-    if (potLastSent[pin] != mapped)
+    bool shifted = isShiftPinActive(c.shiftPin);
+    uint8_t sendChannel = shifted ? c.shiftChannel : c.channel;
+    uint8_t sendNumber = shifted ? c.shiftNumber : c.number;
+
+    // Re-send on a shift-state change even if the raw value hasn't moved --
+    // otherwise the destination CC that shifting just switched to/from would
+    // sit stale (never told the pot's current value) until the pot is
+    // physically nudged. potLastShifted persists this alongside the value
+    // dedup below.
+    if (potLastSent[pin] != mapped || potLastShifted[pin] != shifted)
     {
       potLastSent[pin] = (int16_t)mapped;
-      midiSendCC(c.channel, c.number, (uint8_t)mapped);
+      potLastShifted[pin] = shifted;
+      midiSendCC(sendChannel, sendNumber, (uint8_t)mapped);
     }
   }
 }
@@ -397,6 +441,26 @@ static void applyToOutputPin(uint8_t pin, uint16_t value, uint16_t inMin, uint16
   }
 }
 
+// Drives every LIGHT_DIGITAL/LIGHT_PWM pin whose listenPin targets sourcePin
+// (a button/shift pin that just changed state), bypassing MIDI entirely.
+// Reuses applyToOutputPin so a listen-mode light gets the same in/out
+// mapping (dimming, invert, etc.) a CC-matched one would -- just fed
+// 0/127 directly instead of waiting for a matching Note/CC to arrive.
+static void applyListenLights(uint8_t sourcePin, bool pressed)
+{
+  for (uint8_t pin = 0; pin < PIN_COUNT; pin++)
+  {
+    if (isPinReserved(pin))
+      continue;
+    const PinConfig &c = pinConfigs[pin];
+    if (c.role != ROLE_LIGHT_DIGITAL && c.role != ROLE_LIGHT_PWM)
+      continue;
+    if (c.listenPin != sourcePin)
+      continue;
+    applyToOutputPin(pin, pressed ? 127 : 0, c.inMin, c.inMax);
+  }
+}
+
 void rolesHandleIncomingNote(uint8_t channel, uint8_t note, uint8_t velocity, bool isOn)
 {
   for (uint8_t pin = 0; pin < PIN_COUNT; pin++)
@@ -406,6 +470,8 @@ void rolesHandleIncomingNote(uint8_t channel, uint8_t note, uint8_t velocity, bo
     const PinConfig &c = pinConfigs[pin];
     if (c.role != ROLE_LIGHT_DIGITAL && c.role != ROLE_LIGHT_PWM)
       continue;
+    if (c.listenPin != NO_SHIFT_PIN)
+      continue; // direct-listen mode: driven by applyListenLights(), not incoming MIDI
     if (c.flags & FLAG_MATCH_CC)
       continue; // this pin is set to match CC, not Note
     if (c.channel != channel || c.number != note)
@@ -423,6 +489,8 @@ void rolesHandleIncomingCC(uint8_t channel, uint8_t controller, uint8_t value)
     const PinConfig &c = pinConfigs[pin];
     if (c.role != ROLE_LIGHT_DIGITAL && c.role != ROLE_LIGHT_PWM)
       continue;
+    if (c.listenPin != NO_SHIFT_PIN)
+      continue; // direct-listen mode: driven by applyListenLights(), not incoming MIDI
     if (!(c.flags & FLAG_MATCH_CC))
       continue; // this pin is set to match Note, not CC
     if (c.channel != channel || c.number != controller)

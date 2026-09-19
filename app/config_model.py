@@ -32,6 +32,12 @@ class PinConfig:
     toggle: bool = False
     match_cc: bool = False  # light_digital/light_pwm only: match a CC instead of a Note
     accel: bool = True  # encoder_a only: scale relative CC step size with turn speed
+    shift_pin: int = protocol.NO_SHIFT_PIN  # pot_cc only: shift-group pin (mirrors encoder_a's in_min)
+    shift_channel: int = 0  # pot_cc only: shifted-state MIDI channel
+    shift_number: int = 0  # pot_cc only: shifted-state MIDI CC number
+    # light_digital/light_pwm only: mirror this button/shift pin's live state
+    # directly instead of matching an incoming Note/CC. NO_SHIFT_PIN = off.
+    listen_pin: int = protocol.NO_SHIFT_PIN
 
     @property
     def reserved(self) -> bool:
@@ -49,11 +55,14 @@ class PinConfig:
             role_val, self.channel & 0x0F, self.number & 0x7F,
             self.in_min & 0xFF, self.in_max & 0xFF,
             self.out_min & 0xFF, self.out_max & 0xFF, flags,
+            self.shift_pin & 0xFF, self.shift_channel & 0x0F, self.shift_number & 0x7F,
+            self.listen_pin & 0xFF,
         )
 
     @staticmethod
     def from_tuple(pin: int, t) -> "PinConfig":
-        role_val, channel, number, in_min, in_max, out_min, out_max, flags = t
+        (role_val, channel, number, in_min, in_max, out_min, out_max, flags,
+         shift_pin, shift_channel, shift_number, listen_pin) = t
         return PinConfig(
             pin=pin,
             role=protocol.ROLE_NAMES.get(role_val, "unused"),
@@ -67,6 +76,10 @@ class PinConfig:
             toggle=bool(flags & protocol.FLAG_TOGGLE),
             match_cc=bool(flags & protocol.FLAG_MATCH_CC),
             accel=bool(flags & protocol.FLAG_ACCEL_ENABLE),
+            shift_pin=shift_pin,
+            shift_channel=shift_channel,
+            shift_number=shift_number,
+            listen_pin=listen_pin,
         )
 
     def to_dict(self):
@@ -124,6 +137,8 @@ class SequencerConfig:
     only, on the DeviceSession's SequencerEngine, not here."""
     channel: int = 0
     subdivision: str = "16th"  # "8th" | "16th" | "32nd" | "16th_triplet"
+    enabled: bool = True  # off = DeviceSession never builds a SequencerEngine for this entry
+    step_control: str = "encoder"  # "encoder" | "pot" -- which role each step's value control uses
     steps: List[SequencerStepConfig] = dataclasses.field(
         default_factory=lambda: _default_steps(DEFAULT_STEP_COUNT)
     )
@@ -132,6 +147,8 @@ class SequencerConfig:
         return {
             "channel": self.channel,
             "subdivision": self.subdivision,
+            "enabled": self.enabled,
+            "step_control": self.step_control,
             "steps": [s.to_dict() for s in self.steps],
         }
 
@@ -141,6 +158,8 @@ class SequencerConfig:
         return SequencerConfig(
             channel=d.get("channel", 0),
             subdivision=d.get("subdivision", "16th"),
+            enabled=d.get("enabled", True),
+            step_control=d.get("step_control", "encoder"),
             steps=steps or _default_steps(DEFAULT_STEP_COUNT),
         )
 

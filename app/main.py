@@ -99,12 +99,16 @@ class DeviceSession:
     def rebuild_sequencer(self, sequencer_config: config_model.SequencerConfig, pins):
         if self.sequencer:
             self.sequencer.close()
-        self.sequencer = SequencerEngine(
-            sequencer_config,
-            pins,
-            send_to_daw=self.bridge.send_to_daw,
-            send_to_device=self.link.send_midi_to_device,
-            on_state_change=self._on_sequencer_state,
+        self.sequencer = (
+            SequencerEngine(
+                sequencer_config,
+                pins,
+                send_to_daw=self.bridge.send_to_daw,
+                send_to_device=self.link.send_midi_to_device,
+                on_state_change=self._on_sequencer_state,
+            )
+            if sequencer_config.enabled
+            else None
         )
 
     def close(self):
@@ -234,6 +238,22 @@ class Api:
                 session.close()
         config_model.Entry.delete(id_)
         return True
+
+    def reset_entry_pins(self, id_: str):
+        """Wipes an entry's saved buffer back to a blank profile — every pin
+        back to ROLE_UNUSED and the sequencer back to its defaults (same
+        starting point as a brand new entry). Only updates the saved
+        buffer, same as any other edit; use "Write to device" afterward to
+        push the blank config to the hardware."""
+        entry = config_model.Entry.load(id_)
+        entry.pins = [config_model.PinConfig(pin=i) for i in range(protocol.PIN_COUNT)]
+        entry.sequencer = config_model.SequencerConfig()
+        entry.save()
+        session = self._session_for_device(entry.device_id) if entry.entry_type == "device" else None
+        if session:
+            session.active_pins = entry.pins
+            session.rebuild_sequencer(entry.sequencer, entry.pins)
+        return entry.to_dict()
 
     def update_entry_pins(self, id_: str, pins_dicts, sequencer_dict=None):
         """Debounced auto-save call fired from the UI on every edit — pins
@@ -367,6 +387,103 @@ class Api:
         with self._lock:
             self._attach_session(entry, session)
         return {"ok": True, **self._entry_status(entry)}
+
+    def force_adopt_port(self, id_: str, port: str):
+        """Like reconnect_entry(), but for when the board on `port` reports a
+        different (or no) device id — e.g. a spare/replacement Mega swapped
+        in for a broken one. Flashes this entry's firmware onto it, forces
+        its device id to match, then writes the entry's saved config —
+        making that physical board become this entry from now on.
+
+        Refuses if the board already belongs to a *different* existing
+        entry, so this can't be used to silently steal an already-adopted
+        board out from under its own profile. The UI is expected to have
+        already confirmed the (one-way, destructive) reassignment with the
+        user before calling this — see reconnectEntry()'s mismatch handling
+        in app.js.
+
+        Mirrors flash_port()/flash_firmware()'s logging and error-handling
+        shape (see flash_firmware's docstring for why every step here is
+        wrapped instead of letting exceptions escape to the JS bridge)."""
+        _log(f"force_adopt_port({id_}, {port}): called")
+        entry = config_model.Entry.load(id_)
+        if entry.entry_type != "device":
+            return {"ok": False, "output": "not a device entry"}
+
+        with self._lock:
+            if port in self._devices or port in self._busy_ports:
+                _log(f"force_adopt_port({id_}, {port}): port already connected/busy, aborting")
+                return {"ok": False, "output": "port is already connected; disconnect it first"}
+            self._busy_ports.add(port)
+
+        try:
+            _log(f"force_adopt_port({id_}, {port}): probing board's current id before flashing")
+            probe = DeviceSession(port, self)
+            probe.identify()
+            found_id = probe.device_id
+            probe.close()
+            if found_id and found_id != entry.device_id and config_model.Entry.exists(str(found_id)):
+                other = config_model.Entry.load(str(found_id))
+                _log(f"force_adopt_port({id_}, {port}): refusing, board already belongs to '{other.nickname}' (id {found_id})")
+                return {
+                    "ok": False,
+                    "output": f'that board already belongs to "{other.nickname}" (id {found_id}) — reassign or remove that entry first',
+                }
+
+            _log(f"force_adopt_port({id_}, {port}): invoking avrdude")
+            try:
+                output = flasher.flash(port)
+                _log(f"force_adopt_port({id_}, {port}): avrdude returned OK")
+            except flasher.FlashError as exc:
+                _log(f"force_adopt_port({id_}, {port}): avrdude FAILED: {exc}")
+                return {"ok": False, "output": str(exc)}
+
+            try:
+                _log(f"force_adopt_port({id_}, {port}): reopening {port}, identifying")
+                session = DeviceSession(port, self)
+                session.identify()
+                _log(f"force_adopt_port({id_}, {port}): identify() returned, device_id={session.device_id}")
+            except Exception as exc:
+                _log(f"force_adopt_port({id_}, {port}): reopen/identify raised {exc!r}")
+                return {"ok": False, "output": f"flashed, but couldn't reopen the port afterward ({exc})"}
+
+            if session.device_id != entry.device_id:
+                _log(f"force_adopt_port({id_}, {port}): forcing device id {entry.device_id} (was {session.device_id})")
+                if session.link.enter_config_mode():
+                    if session.link.set_device_id(entry.device_id):
+                        session.device_id = entry.device_id
+                        session._rebuild_bridge()
+                    session.link.resume_run_mode()
+                if session.device_id != entry.device_id:
+                    _log(f"force_adopt_port({id_}, {port}): failed to force device id")
+                    session.close()
+                    return {"ok": False, "output": "flashed, but couldn't assign the device id — try again"}
+
+            with self._lock:
+                self._attach_session(entry, session)
+            _log(f"force_adopt_port({id_}, {port}): reattached, writing config back")
+
+            try:
+                if session.link.enter_config_mode():
+                    write_ok = session.link.write_config(entry.to_blob())
+                    session.link.resume_run_mode()
+                    if write_ok:
+                        session.baseline_pins = entry.pins
+                        session.active_pins = entry.pins
+                else:
+                    _log(f"force_adopt_port({id_}, {port}): couldn't re-enter config mode to write config")
+            except Exception as exc:
+                _log(f"force_adopt_port({id_}, {port}): write_config step raised {exc!r}")
+
+            _log(f"force_adopt_port({id_}, {port}): returning ok")
+            return {"ok": True, "output": output}
+        except Exception as exc:
+            _log(f"force_adopt_port({id_}, {port}): UNEXPECTED exception: {exc!r}")
+            return {"ok": False, "output": f"unexpected error while flashing: {exc}"}
+        finally:
+            with self._lock:
+                self._busy_ports.discard(port)
+            _log(f"force_adopt_port({id_}, {port}): busy marker cleared, method exiting")
 
     def _attach_session(self, entry: "config_model.Entry", session: "DeviceSession"):
         """Hooks up an already-identified session (session.device_id ==
@@ -604,20 +721,27 @@ class Api:
         that doesn't yet run firmware speaking our config protocol — the
         normal adopt_port() path needs that protocol to identify the board,
         which is exactly what a never-flashed board can't do yet."""
+        _log(f"flash_port({port}): called")
         with self._lock:
             if port in self._devices or port in self._busy_ports:
+                _log(f"flash_port({port}): port already connected/busy, aborting")
                 return {"ok": False, "output": "port is already connected; disconnect it first"}
             self._busy_ports.add(port)
         try:
+            _log(f"flash_port({port}): invoking avrdude")
             output = flasher.flash(port)
+            _log(f"flash_port({port}): avrdude returned OK")
             return {"ok": True, "output": output}
         except flasher.FlashError as exc:
+            _log(f"flash_port({port}): avrdude FAILED: {exc}")
             return {"ok": False, "output": str(exc)}
         except Exception as exc:
+            _log(f"flash_port({port}): UNEXPECTED exception: {exc!r}")
             return {"ok": False, "output": f"unexpected error while flashing: {exc}"}
         finally:
             with self._lock:
                 self._busy_ports.discard(port)
+            _log(f"flash_port({port}): busy marker cleared, method exiting")
 
     # ---- event plumbing ----------------------------------------------------
 

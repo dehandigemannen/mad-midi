@@ -56,18 +56,18 @@ so this can never collide with a real device's SysEx.
 
 Reply convention: success = request CMD `| 0x80`, error = request CMD `| 0xC0`.
 
-### EEPROM blob layout (566 bytes of 4096 available)
+### EEPROM blob layout (776 bytes of 4096 available)
 
 ```
 Header (6 bytes):
   [0-1] magic = 'M','M'
-  [2]   config format version (currently 4)
+  [2]   config format version (currently 5)
   [3]   pin count (70)
   [4]   device id (0 = unassigned; set once via SET_DEVICE_ID, persists across reconnects/ports)
   [5]   checksum (sum of all record bytes, mod 256 — does NOT cover the device id byte,
                   so SET_DEVICE_ID can update it independently without a full config rewrite)
 
-Records: 70 x 8 bytes, indexed by Arduino Mega pin number directly
+Records: 70 x 11 bytes, indexed by Arduino Mega pin number directly
   (0-53 = digital pins, 54-69 = A0-A15)
   Reserved indices, not user-configurable: 0, 1 (USB Serial0), 13 (status LED)
 
@@ -79,8 +79,12 @@ Records: 70 x 8 bytes, indexed by Arduino Mega pin number directly
     [4] inMax
     [5] outMin
     [6] outMax
-    [7] flags   (bit0 invert, bit1 toggle-mode, bit2 match-CC-not-Note
-                 [LIGHT_DIGITAL/LIGHT_PWM only, see below]; rest reserved)
+    [7] flags        (bit0 invert, bit1 toggle-mode, bit2 match-CC-not-Note
+                       [LIGHT_DIGITAL/LIGHT_PWM only, see below], bit3
+                       FLAG_ACCEL_ENABLE [ENCODER_A only]; rest reserved)
+    [8] shiftPin     (POT_CC only, see Pot shift fields below)
+    [9] shiftChannel (POT_CC only)
+    [10] shiftNumber (POT_CC only)
 ```
 
 ### PinRole enum (v1)
@@ -94,7 +98,7 @@ Records: 70 x 8 bytes, indexed by Arduino Mega pin number directly
 | 4 | LIGHT_PWM | MIDI in -> PWM out | `analogWrite(map(value, inMin,inMax, outMin,outMax))` — also used for VU meters (single-pin analog needle); Note vs CC selected the same way as LIGHT_DIGITAL |
 | 5 | ENCODER_A | digital-in pair -> MIDI out | quadrature phase A; paired with the next pin (ENCODER_B). Relative CC: value `1` = +1 step (CW), value `127` = -1 step (CCW) per detent. With `FLAG_ACCEL_ENABLE` (flags bit3) set, the step magnitude scales with turn speed instead of staying fixed at 1 (see Encoder acceleration below). Fields are repurposed for shift support (see below) |
 | 6 | ENCODER_B | — | marks the pin as consumed by the preceding ENCODER_A |
-| 7 | POT_CC | analog-in -> MIDI out | raw ADC (0-1023, stored as inMin/inMax >>2) scaled to CC 0-127 |
+| 7 | POT_CC | analog-in -> MIDI out | raw ADC (0-1023, stored as inMin/inMax >>2) scaled to CC 0-127. Optional shift support via dedicated `shiftPin`/`shiftChannel`/`shiftNumber` fields (see below) — unlike ENCODER_A, inMin/inMax/outMin/outMax are already needed for ADC scaling, so shift needs its own fields |
 | 8 | BUTTON_SHIFT | digital-in, modifier only | pure modifier: sends no MIDI of its own; while held, any ENCODER_A pin whose `inMin` names this pin's index switches to its shifted channel/CC |
 
 #### Encoder shift fields (ENCODER_A only)
@@ -114,6 +118,24 @@ specific button, not a device-wide modifier):
 While the referenced shift button is held, a turn sends relative CC on
 `(outMin, outMax)` instead of `(channel, number)` — same encoding either way
 (including acceleration, if enabled).
+
+#### Pot shift fields (POT_CC only)
+
+Same shift-groups model as ENCODER_A above, but pots can't repurpose
+inMin/inMax/outMin/outMax the way encoders do — those are already the ADC-
+to-CC scaling range — so pots get three dedicated fields instead:
+
+| Field | Meaning for POT_CC |
+|---|---|
+| `shiftPin` | pin index of the BUTTON_SHIFT button that shifts this pot; `255` (`NO_SHIFT_PIN`) = no shift button assigned |
+| `shiftChannel` | shifted-state MIDI channel |
+| `shiftNumber` | shifted-state MIDI CC number |
+
+While the referenced shift button is held, the pot's (absolute) value is
+sent on `(shiftChannel, shiftNumber)` instead of `(channel, number)`. Since
+a pot only sends on value change, a shift *transition* with no pot movement
+still forces one re-send on the newly active destination — otherwise it
+would look stale until the pot moves (see `potLastShifted` in roles.cpp).
 
 #### Encoder acceleration (ENCODER_A only)
 
@@ -163,11 +185,21 @@ pin list) rather than introducing a parallel config surface.
 - **Per-step config** (`config_model.SequencerStepConfig`): a note number
   plus up to five pin indices borrowed from the entry's existing pin
   list — a button (enable/disable the step; also its own mute, no
-  separate control), an encoder (live CC while the step plays), a shift
-  button (the encoder's alternate CC, same shift-group mechanism as
-  regular encoders), a PWM pin (mirrors the encoder's current value as a
-  brightness/VU meter), and a step light (flashed for the gate duration
-  while the step plays).
+  separate control), a value control (live CC while the step plays), a
+  shift button (the value control's alternate CC, same shift-group
+  mechanism as regular encoders/pots), a PWM pin (mirrors the value
+  control's current value as a brightness/VU meter), and a step light
+  (flashed for the gate duration while the step plays).
+- **Step value control type** (`SequencerConfig.step_control`, `"encoder"`
+  | `"pot"`, default `"encoder"`): one global choice per entry for what
+  role every step's value-control pin gets assigned — `assignSequencerPin`
+  in app.js wires it to either ENCODER_A (2 digital pins, relative CC) or
+  POT_CC (1 analog pin, absolute CC) accordingly, including the shift-group
+  linkage either role needs. Switching it doesn't retroactively move
+  already-assigned pins — each step's pin has to be reassigned afterward.
+  `SequencerEngine` also branches on this per-step (`_ResolvedStep.is_pot`)
+  since a pot's incoming CC is an absolute value to mirror straight onto
+  the PWM meter, not a relative click to accumulate like an encoder's.
 - **Runtime vs. persisted state**: step count, subdivision, channel,
   per-step notes, and pin assignments are part of the entry and
   auto-saved to its JSON file. The on/off pattern and playback position

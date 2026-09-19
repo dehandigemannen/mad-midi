@@ -284,6 +284,24 @@ function sequencerEligiblePins(stepIndex, fn) {
   const step = state.sequencer.steps[stepIndex];
   const currentlyAssigned = step[fn + "_pin"];
   const needsPwm = SEQ_FNS_NEEDING_PWM.has(fn);
+  const isPotControl = fn === "encoder" && state.sequencer.step_control === "pot";
+
+  // Pot mode needs a single analog pin (A0-A15), not a digital pin pair --
+  // a completely different eligibility rule from the encoder's, so it's
+  // handled separately rather than folded into the loop below.
+  if (isPotControl) {
+    const result = [];
+    for (let pin = 54; pin < PIN_COUNT; pin++) {
+      if (pin === currentlyAssigned) {
+        result.push(pin);
+        continue;
+      }
+      if (pinByIndex(pin).role !== "unused") continue;
+      result.push(pin);
+    }
+    return result;
+  }
+
   // step_light/enabled_light can also live on an analog pin (plain
   // digitalWrite works there); every other function needs a digital pin
   // (button/shift/encoder for input, pwm for actual PWM hardware, which
@@ -319,6 +337,7 @@ function clearSequencerPin(pin) {
   if (p.role === "button_shift") {
     state.pins.forEach((pp) => {
       if (pp.role === "encoder_a" && pp.in_min === pin) pp.in_min = NO_SHIFT_PIN;
+      if (pp.role === "pot_cc" && pp.shift_pin === pin) pp.shift_pin = NO_SHIFT_PIN;
     });
   }
   p.role = "unused";
@@ -346,28 +365,50 @@ function assignSequencerPin(stepIndex, fn, pin) {
       p.channel = ch;
       p.number = SEQ_BASE.button + stepIndex;
     } else if (fn === "encoder") {
-      p.role = "encoder_a";
-      p.channel = ch;
-      p.number = SEQ_BASE.encoder + stepIndex;
-      p.in_min = NO_SHIFT_PIN;
-      if (pin + 1 < PIN_COUNT && !RESERVED_PINS.has(pin + 1)) {
-        const partner = pinByIndex(pin + 1);
-        partner.role = "encoder_b";
-        partner.channel = ch;
-        partner.number = p.number;
-      }
-      if (step.shift_pin !== null && step.shift_pin !== undefined) {
-        p.in_min = step.shift_pin;
-        p.out_min = ch;
-        p.out_max = SEQ_BASE.encoder_shifted + stepIndex;
+      if (state.sequencer.step_control === "pot") {
+        p.role = "pot_cc";
+        p.channel = ch;
+        p.number = SEQ_BASE.encoder + stepIndex;
+        p.in_min = 0;
+        p.in_max = 255;
+        p.out_min = 0;
+        p.out_max = 127;
+        p.shift_pin = NO_SHIFT_PIN;
+        if (step.shift_pin !== null && step.shift_pin !== undefined) {
+          p.shift_pin = step.shift_pin;
+          p.shift_channel = ch;
+          p.shift_number = SEQ_BASE.encoder_shifted + stepIndex;
+        }
+      } else {
+        p.role = "encoder_a";
+        p.channel = ch;
+        p.number = SEQ_BASE.encoder + stepIndex;
+        p.in_min = NO_SHIFT_PIN;
+        if (pin + 1 < PIN_COUNT && !RESERVED_PINS.has(pin + 1)) {
+          const partner = pinByIndex(pin + 1);
+          partner.role = "encoder_b";
+          partner.channel = ch;
+          partner.number = p.number;
+        }
+        if (step.shift_pin !== null && step.shift_pin !== undefined) {
+          p.in_min = step.shift_pin;
+          p.out_min = ch;
+          p.out_max = SEQ_BASE.encoder_shifted + stepIndex;
+        }
       }
     } else if (fn === "shift") {
       p.role = "button_shift";
       if (step.encoder_pin !== null && step.encoder_pin !== undefined) {
         const enc = pinByIndex(step.encoder_pin);
-        enc.in_min = pin;
-        enc.out_min = ch;
-        enc.out_max = SEQ_BASE.encoder_shifted + stepIndex;
+        if (state.sequencer.step_control === "pot") {
+          enc.shift_pin = pin;
+          enc.shift_channel = ch;
+          enc.shift_number = SEQ_BASE.encoder_shifted + stepIndex;
+        } else {
+          enc.in_min = pin;
+          enc.out_min = ch;
+          enc.out_max = SEQ_BASE.encoder_shifted + stepIndex;
+        }
       }
     } else if (fn === "step_light") {
       p.role = "light_digital";
@@ -437,8 +478,12 @@ function setSequencerChannel(value) {
     });
     if (step.encoder_pin !== null && step.encoder_pin !== undefined) {
       const enc = pinByIndex(step.encoder_pin);
-      if (enc.in_min !== NO_SHIFT_PIN) enc.out_min = value;
-      if (step.encoder_pin + 1 < PIN_COUNT) pinByIndex(step.encoder_pin + 1).channel = value;
+      if (enc.role === "pot_cc") {
+        if (enc.shift_pin !== NO_SHIFT_PIN) enc.shift_channel = value;
+      } else {
+        if (enc.in_min !== NO_SHIFT_PIN) enc.out_min = value;
+        if (step.encoder_pin + 1 < PIN_COUNT) pinByIndex(step.encoder_pin + 1).channel = value;
+      }
     }
   });
   scheduleAutoSave();
@@ -448,6 +493,18 @@ function setSequencerChannel(value) {
 function setSequencerSubdivision(value) {
   state.sequencer.subdivision = value;
   scheduleAutoSave();
+}
+
+function setSequencerEnabled(value) {
+  state.sequencer.enabled = value;
+  scheduleAutoSave();
+  renderAll();
+}
+
+function setSequencerStepControl(value) {
+  state.sequencer.step_control = value;
+  scheduleAutoSave();
+  renderAll();
 }
 
 function setStepNote(stepIndex, note) {
@@ -695,7 +752,13 @@ function renderEditor() {
       "Pure modifier — sends no MIDI itself. Assign it as an encoder's shift button below.";
     fields.appendChild(hint);
   }
+  const isListenLight =
+    (p.role === "light_digital" || p.role === "light_pwm") && p.listen_pin !== NO_SHIFT_PIN;
+  if (p.role === "light_digital" || p.role === "light_pwm") {
+    renderListenField(pin, p, fields);
+  }
   ROLE_FIELDS[p.role].forEach((field) => {
+    if (isListenLight && field === "channel") return; // nothing to match against while listening
     if (field === "number") {
       renderNumberField(pin, p, fields);
       return;
@@ -740,11 +803,22 @@ function renderEditor() {
     fields.appendChild(row);
   });
 
-  if (p.role === "encoder_a") renderEncoderShiftFields(pin, p, fields);
+  if (p.role === "encoder_a")
+    renderShiftFields(pin, p, fields, { pinField: "in_min", chField: "out_min", ccField: "out_max" });
+  if (p.role === "pot_cc")
+    renderShiftFields(pin, p, fields, { pinField: "shift_pin", chField: "shift_channel", ccField: "shift_number" });
 }
 
 function renderNumberField(pin, p, fields) {
   const isDualRole = p.role === "light_digital" || p.role === "light_pwm";
+
+  if (isDualRole && p.listen_pin !== NO_SHIFT_PIN) {
+    const hint = document.createElement("div");
+    hint.className = "field-hint";
+    hint.textContent = "Listening directly to a button — Note/CC matching is bypassed.";
+    fields.appendChild(hint);
+    return;
+  }
 
   if (isDualRole) {
     const typeRow = document.createElement("div");
@@ -797,7 +871,11 @@ function renderNumberField(pin, p, fields) {
   fields.appendChild(row);
 }
 
-function renderEncoderShiftFields(pin, p, fields) {
+// Shared by encoder_a (in_min/out_min/out_max, its otherwise-unused value
+// fields) and pot_cc (shift_pin/shift_channel/shift_number, dedicated fields
+// since pots need in_min/in_max/out_min/out_max for ADC->CC scaling) --
+// same shift-group UI, different backing fields per role.
+function renderShiftFields(pin, p, fields, { pinField, chField, ccField }) {
   const shiftButtons = state.pins
     .map((pp, idx) => ({ idx, pp }))
     .filter(({ idx, pp }) => pp.role === "button_shift" && idx !== pin);
@@ -821,12 +899,13 @@ function renderEncoderShiftFields(pin, p, fields) {
   });
 
   const validIds = new Set([NO_SHIFT_PIN, ...shiftButtons.map((s) => s.idx)]);
-  select.value = validIds.has(p.in_min)
-    ? String(p.in_min)
+  const currentShiftPin = p[pinField];
+  select.value = validIds.has(currentShiftPin)
+    ? String(currentShiftPin)
     : String(NO_SHIFT_PIN);
 
   select.addEventListener("change", () => {
-    setPinField(pin, "in_min", parseInt(select.value, 10));
+    setPinField(pin, pinField, parseInt(select.value, 10));
     renderAll();
   });
   row.appendChild(label);
@@ -850,10 +929,10 @@ function renderEncoderShiftFields(pin, p, fields) {
     chInput.type = "number";
     chInput.min = 1;
     chInput.max = 16;
-    chInput.value = p.out_min + 1;
+    chInput.value = p[chField] + 1;
     chInput.addEventListener("change", () => {
       const v = Math.max(1, Math.min(16, parseInt(chInput.value, 10) || 1)) - 1;
-      setPinField(pin, "out_min", v);
+      setPinField(pin, chField, v);
     });
     chRow.appendChild(chLabel);
     chRow.appendChild(chInput);
@@ -867,14 +946,63 @@ function renderEncoderShiftFields(pin, p, fields) {
     ccInput.type = "number";
     ccInput.min = 0;
     ccInput.max = 127;
-    ccInput.value = p.out_max;
+    ccInput.value = p[ccField];
     ccInput.addEventListener("change", () => {
       const v = Math.max(0, Math.min(127, parseInt(ccInput.value, 10) || 0));
-      setPinField(pin, "out_max", v);
+      setPinField(pin, ccField, v);
     });
     ccRow.appendChild(ccLabel);
     ccRow.appendChild(ccInput);
     fields.appendChild(ccRow);
+  }
+}
+
+// light_digital/light_pwm only: mirror a button/shift pin's live state
+// directly (firmware's applyListenLights()) instead of matching an incoming
+// Note/CC. Same picker pattern as renderShiftFields, different source-role
+// filter and a single backing field (no per-target channel/number needed —
+// there's nothing to send, just on/off to mirror).
+function renderListenField(pin, p, fields) {
+  const sourceButtons = state.pins
+    .map((pp, idx) => ({ idx, pp }))
+    .filter(({ pp }) => ["button_note", "button_cc", "button_shift"].includes(pp.role));
+
+  const row = document.createElement("div");
+  row.className = "field-row";
+  const label = document.createElement("label");
+  label.textContent = "Listen to button";
+  const select = document.createElement("select");
+
+  const noneOpt = document.createElement("option");
+  noneOpt.value = String(NO_SHIFT_PIN);
+  noneOpt.textContent = "None (match Note/CC instead)";
+  select.appendChild(noneOpt);
+
+  sourceButtons.forEach(({ idx, pp }) => {
+    const opt = document.createElement("option");
+    opt.value = String(idx);
+    opt.textContent = `Pin ${pinLabel(idx)} (#${idx}, ${ROLE_LABELS[pp.role]})`;
+    select.appendChild(opt);
+  });
+
+  const validIds = new Set([NO_SHIFT_PIN, ...sourceButtons.map((s) => s.idx)]);
+  const currentListenPin = p.listen_pin;
+  select.value = validIds.has(currentListenPin) ? String(currentListenPin) : String(NO_SHIFT_PIN);
+
+  select.addEventListener("change", () => {
+    setPinField(pin, "listen_pin", parseInt(select.value, 10));
+    renderAll();
+  });
+  row.appendChild(label);
+  row.appendChild(select);
+  fields.appendChild(row);
+
+  if (sourceButtons.length === 0) {
+    const hint = document.createElement("div");
+    hint.className = "field-hint";
+    hint.textContent =
+      'No button pins configured yet — set another pin\'s role to a button/shift role first.';
+    fields.appendChild(hint);
   }
 }
 
@@ -889,6 +1017,55 @@ function renderSequencerSettings() {
   const el = document.getElementById("sequencerSettings");
   el.innerHTML = "";
   const seq = state.sequencer;
+
+  const enabledRow = document.createElement("div");
+  enabledRow.className = "field-row checkbox";
+  const enabledLabel = document.createElement("label");
+  enabledLabel.className = "checkbox-label";
+  const enabledInput = document.createElement("input");
+  enabledInput.type = "checkbox";
+  enabledInput.checked = seq.enabled;
+  enabledInput.addEventListener("change", () => setSequencerEnabled(enabledInput.checked));
+  const enabledText = document.createElement("span");
+  enabledText.textContent = "Sequencer enabled";
+  enabledLabel.appendChild(enabledInput);
+  enabledLabel.appendChild(enabledText);
+  enabledRow.appendChild(enabledLabel);
+  el.appendChild(enabledRow);
+
+  if (!seq.enabled) {
+    const disabledHint = document.createElement("div");
+    disabledHint.className = "field-hint";
+    disabledHint.textContent =
+      "Disabled — this device passes MIDI straight through and ignores transport, as if no sequencer pins were configured. The setup below is kept, so you can still edit it while it's off.";
+    el.appendChild(disabledHint);
+  }
+
+  const controlRow = document.createElement("div");
+  controlRow.className = "field-row";
+  const controlLabel = document.createElement("label");
+  controlLabel.textContent = "Step value control";
+  const controlSelect = document.createElement("select");
+  [
+    ["encoder", "Encoder (2-pin, relative)"],
+    ["pot", "Pot/Fader (analog pin, absolute)"],
+  ].forEach(([value, text]) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = text;
+    if (value === (seq.step_control || "encoder")) opt.selected = true;
+    controlSelect.appendChild(opt);
+  });
+  controlSelect.addEventListener("change", () => setSequencerStepControl(controlSelect.value));
+  controlRow.appendChild(controlLabel);
+  controlRow.appendChild(controlSelect);
+  el.appendChild(controlRow);
+
+  const controlHint = document.createElement("div");
+  controlHint.className = "field-hint";
+  controlHint.textContent =
+    "Applies to every step's value control. Switching doesn't move already-assigned pins — reassign each step's pin below after switching.";
+  el.appendChild(controlHint);
 
   const countRow = document.createElement("div");
   countRow.className = "field-row";
@@ -954,7 +1131,8 @@ function buildSequencerPinSelect(stepIndex, fn, currentPin) {
   const wrap = document.createElement("div");
   wrap.className = "field-row";
   const label = document.createElement("label");
-  label.textContent = SEQ_FN_LABELS[fn];
+  label.textContent =
+    fn === "encoder" && state.sequencer.step_control === "pot" ? "Pot" : SEQ_FN_LABELS[fn];
   wrap.appendChild(label);
 
   const select = document.createElement("select");
@@ -986,23 +1164,25 @@ function buildSequencerPinSelect(stepIndex, fn, currentPin) {
   return wrap;
 }
 
-// Makes the encoder/shift link (set automatically by assignSequencerPin,
-// whichever order the two are assigned in) visible — otherwise there's no
-// way to tell from this tab alone that turning the encoder while holding
-// shift actually sends a different CC.
+// Makes the encoder/pot <-> shift link (set automatically by
+// assignSequencerPin, whichever order the two are assigned in) visible --
+// otherwise there's no way to tell from this tab alone that turning the
+// encoder/pot while holding shift actually sends a different CC.
 function buildEncoderShiftLinkHint(step) {
   const hint = document.createElement("div");
   hint.className = "field-hint sequencer-link-hint";
   const hasEncoder = step.encoder_pin !== null && step.encoder_pin !== undefined;
   const hasShift = step.shift_pin !== null && step.shift_pin !== undefined;
+  const noun = state.sequencer.step_control === "pot" ? "pot" : "encoder";
 
   if (hasEncoder && hasShift) {
     const enc = pinByIndex(step.encoder_pin);
-    hint.textContent = `✓ Shift linked — plain turn sends CC ${enc.number}, shift+turn sends CC ${enc.out_max} (both on channel ${enc.channel + 1})`;
+    const shiftedCc = enc.role === "pot_cc" ? enc.shift_number : enc.out_max;
+    hint.textContent = `✓ Shift linked — plain turn sends CC ${enc.number}, shift+turn sends CC ${shiftedCc} (both on channel ${enc.channel + 1})`;
   } else if (hasEncoder && !hasShift) {
-    hint.textContent = "No shift assigned — this encoder always sends its plain CC.";
+    hint.textContent = `No shift assigned — this ${noun} always sends its plain CC.`;
   } else if (!hasEncoder && hasShift) {
-    hint.textContent = "This shift button isn't linked to anything yet — assign this step's encoder to link it.";
+    hint.textContent = `This shift button isn't linked to anything yet — assign this step's ${noun} to link it.`;
   } else {
     hint.hidden = true;
   }
@@ -1299,7 +1479,22 @@ async function toggleReconnectPicker(id) {
 async function reconnectEntry(id, port) {
   state.reconnectingId = null;
   const result = await api("reconnect_entry", id, port);
-  if (!result.ok) alert("Could not reconnect: " + result.error);
+  if (!result.ok) {
+    const isMismatch = result.error && result.error.includes("different id");
+    if (isMismatch) {
+      const proceed = confirm(
+        `${result.error}\n\n` +
+          `Flash this entry's firmware onto that board instead and make it take over as this device? ` +
+          `This overwrites its firmware and device id — this cannot be undone. Are you sure?`
+      );
+      if (proceed) {
+        const forced = await api("force_adopt_port", id, port);
+        if (!forced.ok) alert("Force reflash failed:\n\n" + forced.output);
+      }
+    } else {
+      alert("Could not reconnect: " + result.error);
+    }
+  }
   await refreshEntries();
   if (state.selectedId === id) await selectEntry(id);
 }
@@ -1328,6 +1523,12 @@ function renderHeader() {
   name.className = "eh-name";
   name.textContent = entry.nickname;
   el.appendChild(name);
+
+  const resetBtn = document.createElement("button");
+  resetBtn.textContent = "Reset profile";
+  resetBtn.title = "Clear every pin role and sequencer setup back to blank";
+  resetBtn.addEventListener("click", () => resetProfile(entry.id));
+  el.appendChild(resetBtn);
 
   if (entry.entry_type === "device") {
     const badge = document.createElement("span");
@@ -1402,7 +1603,7 @@ async function selectEntry(id) {
   state.sequencerLive = null;
   if (id === ALL_DEVICES_ID) {
     state.pins = [];
-    state.sequencer = { channel: 0, subdivision: "16th", steps: [] };
+    state.sequencer = { channel: 0, subdivision: "16th", enabled: true, step_control: "encoder", steps: [] };
   } else {
     const dict = await api("get_entry", id);
     state.pins = dict.pins;
@@ -1419,6 +1620,23 @@ async function readFromDevice() {
     alert("Failed to read config from device.");
     return;
   }
+  if (state.selectedId === id) {
+    state.pins = dict.pins;
+    state.sequencer = dict.sequencer;
+    state.selectedPin = null;
+    renderAll();
+  }
+}
+
+async function resetProfile(id) {
+  if (
+    !confirm(
+      "Reset this profile? Every pin role and the sequencer setup are cleared back to blank. This cannot be undone (unless you still have it on the device to read back). Are you sure?"
+    )
+  )
+    return;
+  const dict = await api("reset_entry_pins", id);
+  await refreshEntries();
   if (state.selectedId === id) {
     state.pins = dict.pins;
     state.sequencer = dict.sequencer;
