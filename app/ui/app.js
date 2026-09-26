@@ -173,12 +173,14 @@ const state = {
   reconnectingId: null, // entry id whose inline "connect to port" picker is open
   reconnectPorts: [],
   sequencer: null, // {channel, subdivision, steps: [...]} for the selected entry
-  sequencerLive: null, // {device_id, running, current_step, step_enabled} pushed from a connected device, or null
+  sequencerLive: null, // {device_id, running, current_step, step_enabled, bpm} pushed from a connected device, or null
+  sequencerLiveAt: 0, // Date.now() of the last sequencerLive push, to spot the clock going quiet
   drone: null, // {enabled, channel, control_type, segments: [...]} for the selected entry
   droneLive: null, // {device_id, enabled: [...]} pushed from a connected device, or null
   fxRack: null, // {enabled, channel, segments: [...]} for the selected entry
   fxRackLive: null, // {device_id, enabled: [...]} pushed from a connected device, or null
   joystick: null, // {enabled, x_pin, y_pin, z_pin, button_pin} for the selected entry
+  pinTest: blankPinTest(), // Test tab session, see syncPinTest()
   flashingId: null, // entry id currently mid flash_firmware() call, or null -- keeps the button disabled/labeled through the operation's own disconnect/reconnect
 };
 
@@ -1240,6 +1242,46 @@ function renderSequencerSettings() {
   hint.textContent =
     "Slaved to external MIDI Clock/Start/Stop/Continue only — stays idle until a DAW sends one.";
   el.appendChild(hint);
+
+  const status = document.createElement("div");
+  status.id = "seqClockStatus";
+  status.className = "seq-clock-status";
+  el.appendChild(status);
+  updateSeqClockStatus();
+}
+
+const SEQ_CLOCK_STALE_MS = 1500;
+
+// Says which of the usual reasons the sequencer is silent applies: no clock
+// from the DAW, transport stopped, or every step switched off.
+function updateSeqClockStatus() {
+  const el = document.getElementById("seqClockStatus");
+  if (!el) return;
+  const entry = selectedEntry();
+  const live = state.sequencerLive;
+  const fresh = live && Date.now() - state.sequencerLiveAt < SEQ_CLOCK_STALE_MS;
+  let text;
+  let kind = "warn";
+  if (!entry || entry.entry_type !== "device") {
+    text = "Sequencer runs on a connected device, not a draft.";
+  } else if (!entry.connected) {
+    text = "Device offline — connect it to run the sequencer.";
+  } else if (!live || live.bpm == null) {
+    text =
+      `No MIDI clock yet. In Ableton: Settings → Link, Tempo & MIDI → MIDI Ports, turn on Sync for the ` +
+      `output “Mad Midi ${entry.device_id} In”, then press play.`;
+  } else if (!live.running) {
+    text = fresh ? `Clock OK (${live.bpm} BPM) — stopped. Press play in the DAW.` : "Stopped.";
+  } else if (!fresh) {
+    text = "Clock stopped arriving — is the DAW still playing, with Sync on?";
+  } else if (!live.step_enabled.some(Boolean)) {
+    text = `Playing at ${live.bpm} BPM, but every step is off — switch some on below (or with their buttons).`;
+  } else {
+    text = `▶ Playing · ${live.bpm} BPM · step ${live.current_step + 1}`;
+    kind = "ok";
+  }
+  el.textContent = text;
+  el.className = `seq-clock-status ${kind}`;
 }
 
 function buildSequencerPinSelect(stepIndex, fn, currentPin) {
@@ -2061,6 +2103,26 @@ function buildJoystickPinSelect(axis) {
   });
   wrap.appendChild(select);
 
+  // Same flag as the pin's own Invert checkbox -- flips it on the device, so
+  // a stick wired backwards reads the right way round in the DAW too.
+  const assigned = currentPin !== null && currentPin !== undefined ? pinByIndex(currentPin) : null;
+  if (axis !== "button" && assigned && assigned.role === "pot_cc") {
+    const invLabel = document.createElement("label");
+    invLabel.className = "checkbox-label";
+    const inv = document.createElement("input");
+    inv.type = "checkbox";
+    inv.checked = !!assigned.invert;
+    inv.addEventListener("change", () => {
+      setPinField(currentPin, "invert", inv.checked);
+      renderAll();
+    });
+    const invText = document.createElement("span");
+    invText.textContent = "Invert direction (needs Write to device)";
+    invLabel.appendChild(inv);
+    invLabel.appendChild(invText);
+    wrap.appendChild(invLabel);
+  }
+
   if (eligible.length === 0 && (currentPin === null || currentPin === undefined)) {
     const hint = document.createElement("span");
     hint.className = "field-hint";
@@ -2092,13 +2154,43 @@ function renderJoystickTab() {
   monitor.appendChild(dot);
   el.appendChild(monitor);
 
+  // Rotation rests at the middle of its range and twists either way, so it
+  // gets a centre-zero bar: fill grows left or right from the centre mark.
+  const zWrap = document.createElement("div");
+  zWrap.className = "joystick-z";
+  const zLabels = document.createElement("div");
+  zLabels.className = "joystick-z-labels";
+  zLabels.innerHTML = "<span>◀ Left</span><span>Rotation</span><span>Right ▶</span>";
+  zWrap.appendChild(zLabels);
   const zRow = document.createElement("div");
   zRow.className = "joystick-zbar-wrap";
   const zFill = document.createElement("div");
   zFill.id = "joystickZFill";
   zFill.className = "joystick-zbar-fill";
   zRow.appendChild(zFill);
-  el.appendChild(zRow);
+  const zCentre = document.createElement("div");
+  zCentre.className = "joystick-zbar-centre";
+  zRow.appendChild(zCentre);
+  zWrap.appendChild(zRow);
+  const zValue = document.createElement("div");
+  zValue.id = "joystickZValue";
+  zValue.className = "joystick-z-value";
+  zWrap.appendChild(zValue);
+  el.appendChild(zWrap);
+  positionJoystickZ(JOYSTICK_Z_CENTRE);
+}
+
+const JOYSTICK_Z_CENTRE = 64; // CC value the rotation axis rests at
+
+function positionJoystickZ(value) {
+  const fill = document.getElementById("joystickZFill");
+  const label = document.getElementById("joystickZValue");
+  if (!fill || !label) return;
+  const offset = value - JOYSTICK_Z_CENTRE; // -64 (full left) .. +63 (full right)
+  const pct = Math.min(50, Math.round((Math.abs(offset) / JOYSTICK_Z_CENTRE) * 50));
+  fill.style.width = `${pct}%`;
+  fill.style.left = offset < 0 ? `${50 - pct}%` : "50%";
+  label.textContent = offset === 0 ? "Centre (64)" : `${offset > 0 ? "+" : ""}${offset} (${value})`;
 }
 
 function updateJoystickVisual(pin, value) {
@@ -2112,7 +2204,7 @@ function updateJoystickVisual(pin, value) {
     dot.dataset.y = value;
     positionJoystickDot(dot);
   } else if (zFill && pin === state.joystick.z_pin) {
-    zFill.style.width = `${Math.round((value / 127) * 100)}%`;
+    positionJoystickZ(value);
   }
 }
 
@@ -2121,6 +2213,232 @@ function positionJoystickDot(dot) {
   const y = dot.dataset.y !== undefined ? parseInt(dot.dataset.y, 10) : 64;
   dot.style.left = `${Math.round((x / 127) * 100)}%`;
   dot.style.top = `${Math.round((1 - y / 127) * 100)}%`;
+}
+
+// ---- rendering: test view -----------------------------------------------------
+// Drives pins straight HIGH/LOW for checking wiring. While this tab is open the
+// device is held in config mode (MIDI paused); leaving the tab, switching entry
+// or disconnecting hands every tested pin back to its configured role.
+
+function blankPinTest() {
+  // status: idle | starting | active; levels: pin -> "high"/"low"/"input";
+  // live: last {digital, analog} pushed by the device's pin_test_state poll
+  return { entryId: null, status: "idle", error: null, levels: {}, live: null };
+}
+
+function pinTestWanted() {
+  const entry = selectedEntry();
+  return state.view === "test" && entry && entry.entry_type === "device" && entry.connected ? entry : null;
+}
+
+// Idempotent -- called from renderTabs() and refreshEntries(), so it starts or
+// stops the device-side test session whenever the tab, selection, or
+// connection state changes.
+async function syncPinTest() {
+  const pt = state.pinTest;
+  const wanted = pinTestWanted();
+  if (pt.entryId && (!wanted || wanted.id !== pt.entryId)) {
+    const id = pt.entryId;
+    state.pinTest = blankPinTest();
+    renderTestTab();
+    await api("stop_pin_test", id);
+    return;
+  }
+  if (!wanted) {
+    if (pt.error && state.view !== "test") state.pinTest = blankPinTest();
+    return;
+  }
+  if (pt.status !== "idle" || pt.error) return; // already running, or failed until the tab is reopened
+  pt.entryId = wanted.id;
+  pt.status = "starting";
+  renderTestTab();
+  const result = await api("start_pin_test", wanted.id);
+  if (state.pinTest !== pt) return; // stopped while we were waiting
+  if (result.ok) {
+    pt.status = "active";
+  } else {
+    state.pinTest = { ...blankPinTest(), error: result.error };
+  }
+  renderTestTab();
+}
+
+async function setTestPin(pin, level) {
+  const pt = state.pinTest;
+  if (pt.status !== "active") return;
+  const ok = await api("test_pin", pt.entryId, pin, level);
+  if (state.pinTest !== pt) return;
+  if (!ok) {
+    pt.error = `Device rejected ${pinLabel(pin)} → ${level}.`;
+  } else if (level === "release") {
+    delete pt.levels[pin];
+  } else {
+    pt.levels[pin] = level;
+  }
+  renderTestTab();
+}
+
+async function setAllTestPins(level) {
+  const pins = level === "release" ? Object.keys(state.pinTest.levels).map(Number) : testablePins();
+  for (const pin of pins) await setTestPin(pin, level);
+}
+
+function testablePins() {
+  const pins = [];
+  for (let i = 0; i < PIN_COUNT; i++) if (!RESERVED_PINS.has(i)) pins.push(i);
+  return pins;
+}
+
+function renderTestTab() {
+  const settings = document.getElementById("testSettings");
+  const grid = document.getElementById("testGrid");
+  if (!settings || !grid) return;
+  settings.innerHTML = "";
+  grid.innerHTML = "";
+
+  const entry = selectedEntry();
+  const pt = state.pinTest;
+  const active = pt.status === "active" && entry && pt.entryId === entry.id;
+
+  const status = document.createElement("p");
+  status.className = "field-hint test-status";
+  if (pt.error) {
+    status.classList.add("error");
+    status.textContent = pt.error;
+  } else if (!entry || entry.entry_type !== "device") {
+    status.textContent = "Pin testing needs an adopted device.";
+  } else if (!entry.connected) {
+    status.textContent = "Connect the device to test its pins.";
+  } else if (pt.status === "starting") {
+    status.textContent = "Putting the device into test mode…";
+  } else {
+    status.textContent =
+      "Test mode: MIDI is paused. H/L drive a pin, In reads it with a pull-up (for a button on a pin with no button role). Every pin shows its live level; analog pins also show their 0–1023 reading. Leaving this tab puts every pin back on its configured role.";
+  }
+  settings.appendChild(status);
+
+  const allLow = document.createElement("button");
+  allLow.textContent = "All low";
+  allLow.disabled = !active;
+  allLow.addEventListener("click", () => setAllTestPins("low"));
+  settings.appendChild(allLow);
+
+  const releaseAll = document.createElement("button");
+  releaseAll.textContent = "Release all";
+  releaseAll.disabled = !active || Object.keys(pt.levels).length === 0;
+  releaseAll.addEventListener("click", () => setAllTestPins("release"));
+  settings.appendChild(releaseAll);
+
+  const addRow = (label, pins) => {
+    const wrap = document.createElement("div");
+    const rowLabel = document.createElement("div");
+    rowLabel.className = "board-row-label";
+    rowLabel.textContent = label;
+    wrap.appendChild(rowLabel);
+    const row = document.createElement("div");
+    row.className = "board-row";
+    pins.forEach((pin) => row.appendChild(buildTestPinBox(pin, active)));
+    wrap.appendChild(row);
+    grid.appendChild(wrap);
+  };
+  const range = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+  addRow("Digital 0–13", range(0, 13));
+  addRow("Digital 14–53", range(14, 53));
+  addRow("Analog A0–A15", range(54, PIN_COUNT - 1));
+  updateTestLive();
+}
+
+function buildTestPinBox(pin, active) {
+  const p = pinByIndex(pin);
+  const level = state.pinTest.levels[pin];
+  const reserved = RESERVED_PINS.has(pin);
+  const box = document.createElement("div");
+  box.className = "pin-box test-pin" + (level ? ` level-${level}` : "");
+  if (reserved) box.classList.add("reserved");
+
+  const pn = document.createElement("div");
+  pn.className = "pn";
+  pn.textContent = pinLabel(pin);
+  box.appendChild(pn);
+
+  const role = document.createElement("div");
+  role.className = "role";
+  role.textContent = reserved
+    ? pin === 13 ? "LED" : "USB"
+    : !p || p.role === "unused" ? "–" : ROLE_LABELS[p.role].replace(" → ", "→");
+  box.appendChild(role);
+
+  box.id = `testpin-${pin}`;
+  const live = document.createElement("div");
+  live.className = "test-live";
+  const dot = document.createElement("span");
+  dot.className = "test-dot";
+  const text = document.createElement("span");
+  text.className = "test-live-text";
+  live.appendChild(dot);
+  live.appendChild(text);
+  box.appendChild(live);
+
+  if (isAnalogPin(pin)) {
+    const bar = document.createElement("div");
+    bar.className = "test-abar";
+    const fill = document.createElement("div");
+    fill.className = "test-abar-fill";
+    bar.appendChild(fill);
+    box.appendChild(bar);
+  }
+
+  if (!reserved) {
+    const btns = document.createElement("div");
+    btns.className = "test-btns";
+    const titles = { high: "Drive high", low: "Drive low", input: "Read as input with pull-up" };
+    [["high", "H"], ["low", "L"], ["input", "In"]].forEach(([lvl, text]) => {
+      const b = document.createElement("button");
+      b.textContent = text;
+      b.className = level === lvl ? "on" : "";
+      b.disabled = !active;
+      b.title = level === lvl ? "Release (back to its role)" : titles[lvl];
+      b.addEventListener("click", () => setTestPin(pin, level === lvl ? "release" : lvl));
+      btns.appendChild(b);
+    });
+    box.appendChild(btns);
+  }
+  return box;
+}
+
+const BUTTON_ROLES = new Set(["button_note", "button_cc", "button_shift"]);
+
+// Patches the live readouts in place rather than re-rendering: this runs on
+// every poll (~20x/s) and rebuilding the boxes would eat clicks mid-press.
+function updateTestLive() {
+  const live = state.pinTest.live;
+  for (let pin = 0; pin < PIN_COUNT; pin++) {
+    const box = document.getElementById(`testpin-${pin}`);
+    if (!box) continue;
+    const dot = box.querySelector(".test-dot");
+    const text = box.querySelector(".test-live-text");
+    const fill = box.querySelector(".test-abar-fill");
+    if (!live) {
+      box.classList.remove("live-high", "pressed");
+      text.textContent = "";
+      if (fill) fill.style.width = "0%";
+      continue;
+    }
+    const high = live.digital[pin];
+    const p = pinByIndex(pin);
+    // Buttons are wired to GND with a pull-up, so pressed = LOW unless inverted.
+    const isButton = p && BUTTON_ROLES.has(p.role);
+    const pressed = isButton && (p.invert ? high : !high);
+    box.classList.toggle("live-high", high);
+    box.classList.toggle("pressed", pressed);
+    dot.title = high ? "HIGH" : "LOW";
+    if (isAnalogPin(pin)) {
+      const v = live.analog[pin - 54];
+      text.textContent = String(v);
+      fill.style.width = `${Math.round((v / 1023) * 100)}%`;
+    } else {
+      text.textContent = isButton ? (pressed ? "pressed" : "–") : high ? "HIGH" : "LOW";
+    }
+  }
 }
 
 // ---- sidebar ----------------------------------------------------------------
@@ -2383,6 +2701,7 @@ async function refreshEntries() {
   state.entries = await api("list_entries");
   renderSidebar();
   renderHeader();
+  syncPinTest();
 }
 
 // ---- feature toggles + tab bar ----------------------------------------------
@@ -2397,6 +2716,7 @@ const TAB_DEFS = [
   { key: "drone", label: "Drone", viewId: "droneView", stateKey: "drone" },
   { key: "fx_rack", label: "FX Rack", viewId: "fxRackView", stateKey: "fxRack" },
   { key: "joystick", label: "Joystick", viewId: "joystickView", stateKey: "joystick" },
+  { key: "test", label: "Test", viewId: "testView", deviceOnly: true },
 ];
 
 function setFeatureEnabled(stateKey, value) {
@@ -2436,7 +2756,11 @@ function buildFeatureToggles() {
 function renderTabs() {
   const container = document.getElementById("viewTabs");
   if (!container) return;
-  const visible = TAB_DEFS.filter((t) => t.always || (state[t.stateKey] && state[t.stateKey].enabled));
+  const entry = selectedEntry();
+  const isDevice = !!entry && entry.entry_type === "device";
+  const visible = TAB_DEFS.filter(
+    (t) => t.always || (t.deviceOnly ? isDevice : state[t.stateKey] && state[t.stateKey].enabled)
+  );
   if (!visible.some((t) => t.key === state.view)) {
     state.view = "table";
   }
@@ -2455,6 +2779,7 @@ function renderTabs() {
     const el = document.getElementById(def.viewId);
     if (el) el.classList.toggle("active", state.view === def.key);
   });
+  syncPinTest();
 }
 
 // ---- header (per-entry actions) ---------------------------------------------
@@ -2577,6 +2902,7 @@ async function selectEntry(id) {
 async function readFromDevice() {
   const id = state.selectedId;
   const dict = await api("read_device_config", id);
+  state.pinTest = blankPinTest(); // the read ended any test session; syncPinTest() restarts it if still on the tab
   await refreshEntries();
   if (!dict) {
     alert("Failed to read config from device.");
@@ -2616,6 +2942,7 @@ async function resetProfile(id) {
 async function writeToDevice() {
   const id = state.selectedId;
   const ok = await api("write_device_config", id);
+  state.pinTest = blankPinTest(); // see readFromDevice()
   await refreshEntries();
   if (!ok) alert("Write failed (version/checksum mismatch?).");
 }
@@ -2643,6 +2970,7 @@ async function flashFirmware() {
     }
   } finally {
     state.flashingId = null;
+    state.pinTest = blankPinTest(); // see readFromDevice()
     renderAll();
   }
 }
@@ -2723,6 +3051,7 @@ function renderAll() {
     renderDroneTab();
     renderFxRackTab();
     renderJoystickTab();
+    renderTestTab();
   }
   renderTabs();
   renderSidebar();
@@ -2762,7 +3091,9 @@ function initEventListeners() {
     const entry = selectedEntry();
     if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
     state.sequencerLive = e.detail;
+    state.sequencerLiveAt = Date.now();
     renderSequencerSteps();
+    updateSeqClockStatus();
   });
 
   window.addEventListener("drone_state", (e) => {
@@ -2770,6 +3101,14 @@ function initEventListeners() {
     if (!entry || entry.entry_type !== "device" || e.detail.device_id !== entry.device_id) return;
     state.droneLive = e.detail;
     renderDroneSegments();
+  });
+
+  window.addEventListener("pin_test_state", (e) => {
+    const entry = selectedEntry();
+    const pt = state.pinTest;
+    if (!entry || pt.status !== "active" || pt.entryId !== entry.id || e.detail.device_id !== entry.device_id) return;
+    pt.live = e.detail;
+    updateTestLive();
   });
 
   window.addEventListener("fx_state", (e) => {
@@ -2786,6 +3125,7 @@ async function init() {
   const first = sortedEntries()[0];
   await selectEntry(first ? first.id : ALL_DEVICES_ID);
   setInterval(refreshEntries, 1500);
+  setInterval(updateSeqClockStatus, 500); // catches the clock going quiet, which sends no event
 }
 
 window.addEventListener("pywebviewready", init);

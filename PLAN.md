@@ -53,6 +53,8 @@ so this can never collide with a real device's SysEx.
 | 0x03 | WRITE_CONFIG | full EEPROM blob | 0x83 / 0xC3 | — / `[error_code]` |
 | 0x04 | RESUME_RUN | — | 0x84 | — |
 | 0x05 | SET_DEVICE_ID | `[new_device_id]` | 0x85 / 0xC5 | — / `[error_code]` |
+| 0x06 | TEST_PIN | `[pin, level]` (0 = low, 1 = high, 2 = release to role, 3 = input pull-up) | 0x86 / 0xC6 | — / `[error_code]` |
+| 0x07 | READ_PINS | — | 0x87 | 9-byte digital bitmask (bit n = pin n), then A0–A15 as 16 × LE uint16 `analogRead()` |
 
 Reply convention: success = request CMD `| 0x80`, error = request CMD `| 0xC0`.
 
@@ -98,7 +100,7 @@ Records: 70 x 11 bytes, indexed by Arduino Mega pin number directly
 | 4 | LIGHT_PWM | MIDI in -> PWM out | `analogWrite(map(value, inMin,inMax, outMin,outMax))` — also used for VU meters (single-pin analog needle); Note vs CC selected the same way as LIGHT_DIGITAL |
 | 5 | ENCODER_A | digital-in pair -> MIDI out | quadrature phase A; paired with the next pin (ENCODER_B). Relative CC: value `1` = +1 step (CW), value `127` = -1 step (CCW) per detent. With `FLAG_ACCEL_ENABLE` (flags bit3) set, the step magnitude scales with turn speed instead of staying fixed at 1 (see Encoder acceleration below). Fields are repurposed for shift support (see below) |
 | 6 | ENCODER_B | — | marks the pin as consumed by the preceding ENCODER_A |
-| 7 | POT_CC | analog-in -> MIDI out | raw ADC (0-1023, stored as inMin/inMax >>2) scaled to CC 0-127. Optional shift support via dedicated `shiftPin`/`shiftChannel`/`shiftNumber` fields (see below) — unlike ENCODER_A, inMin/inMax/outMin/outMax are already needed for ADC scaling, so shift needs its own fields |
+| 7 | POT_CC | analog-in -> MIDI out | raw ADC (0-1023, stored as inMin/inMax >>2) scaled to CC 0-127, with a 4-count movement threshold against ADC jitter (`POT_HYSTERESIS` in roles.cpp). Optional shift support via dedicated `shiftPin`/`shiftChannel`/`shiftNumber` fields (see below) — unlike ENCODER_A, inMin/inMax/outMin/outMax are already needed for ADC scaling, so shift needs its own fields |
 | 8 | BUTTON_SHIFT | digital-in, modifier only | pure modifier: sends no MIDI of its own; while held, any ENCODER_A pin whose `inMin` names this pin's index switches to its shifted channel/CC |
 
 #### Encoder shift fields (ENCODER_A only)

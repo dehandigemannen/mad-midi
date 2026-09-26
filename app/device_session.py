@@ -6,10 +6,12 @@ multi-device design this implements."""
 
 import os
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
 import config_model
+import protocol
 import serial_link
 from drone import DroneEngine
 from fx_rack import FxRackEngine
@@ -28,6 +30,19 @@ def _log(msg: str):
     else."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
+
+# How often the Test tab's live pin state is polled. Each poll also counts as
+# config-mode activity, so it doubles as the keepalive against the
+# firmware's 15s CONFIG_TIMEOUT_MS (mode.cpp) -- but if the app dies
+# mid-test the device still times out and restores its pins itself.
+PIN_TEST_POLL_S = 0.05
+
+_PIN_TEST_LEVELS = {
+    "low": protocol.PIN_TEST_LOW,
+    "high": protocol.PIN_TEST_HIGH,
+    "release": protocol.PIN_TEST_RELEASE,
+    "input": protocol.PIN_TEST_INPUT,
+}
 
 _OUTPUT_ROLES = ("light_digital", "light_pwm")
 _INPUT_ROLES = ("button_note", "button_cc", "encoder_a", "pot_cc")
@@ -71,6 +86,7 @@ class DeviceSession:
         self.sequencer: Optional[SequencerEngine] = None
         self.drone: Optional[DroneEngine] = None
         self.fx_rack: Optional[FxRackEngine] = None
+        self._pin_test_stop: Optional[threading.Event] = None  # set while a pin test holds config mode
 
         self._api = api
         self.link = serial_link.SerialLink(
@@ -109,8 +125,7 @@ class DeviceSession:
         )
 
     def rebuild_engines(self, entry: "config_model.Entry"):
-        if self.sequencer:
-            self.sequencer.close()
+        old_sequencer = self.sequencer
         if self.drone:
             self.drone.close()
         if self.fx_rack:
@@ -132,6 +147,10 @@ class DeviceSession:
             if entry.sequencer.enabled
             else None
         )
+        if old_sequencer:
+            if self.sequencer:
+                self.sequencer.adopt_runtime_state(old_sequencer)
+            old_sequencer.close()
         self.drone = (
             DroneEngine(entry.drone, entry.pins, on_state_change=self._on_drone_state)
             if entry.drone.enabled
@@ -143,7 +162,53 @@ class DeviceSession:
             else None
         )
 
+    # ---- pin test (Test tab) ---------------------------------------------
+    #
+    # Holds the device in config mode for the whole test session: the
+    # firmware only honors CMD_TEST_PIN there (so no MIDI roles fight the
+    # driven pins), and restores every tested pin to its role on the way
+    # back to RUN mode.
+
+    @property
+    def pin_testing(self) -> bool:
+        return self._pin_test_stop is not None
+
+    def start_pin_test(self) -> Optional[str]:
+        """Returns an error message, or None on success."""
+        if self.pin_testing:
+            return None
+        if (self.fw_version or 0) < protocol.PIN_TEST_MIN_FW_VERSION:
+            return "this device's firmware predates pin testing; flash firmware first"
+        if not self.link.enter_config_mode():
+            return "couldn't put the device into config mode"
+        stop = threading.Event()
+        self._pin_test_stop = stop
+        threading.Thread(target=self._pin_test_poll, args=(stop,), daemon=True).start()
+        return None
+
+    def _pin_test_poll(self, stop: threading.Event):
+        last = None
+        while not stop.wait(PIN_TEST_POLL_S):
+            pin_state = self.link.read_pins(timeout=1.0)
+            if pin_state is None or pin_state == last or stop.is_set():
+                continue
+            last = pin_state
+            self._api._emit("pin_test_state", {"device_id": self.device_id, **pin_state})
+
+    def stop_pin_test(self):
+        if not self._pin_test_stop:
+            return
+        self._pin_test_stop.set()
+        self._pin_test_stop = None
+        self.link.resume_run_mode()
+
+    def test_pin(self, pin: int, level: str) -> bool:
+        if not self.pin_testing or level not in _PIN_TEST_LEVELS:
+            return False
+        return self.link.test_pin(pin, _PIN_TEST_LEVELS[level])
+
     def close(self):
+        self.stop_pin_test()
         if self.sequencer:
             self.sequencer.close()
         if self.drone:

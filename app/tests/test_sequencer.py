@@ -164,6 +164,48 @@ def test_enabled_light_tracks_step_on_off_state():
     assert tuple(device_messages[-1]) == (0xB0 | 9, 90, 127)
 
 
+def test_rebuilt_engine_keeps_transport_and_pattern():
+    # Every UI edit rebuilds the engine (DeviceSession.rebuild_engines); a
+    # rebuild mid-playback must not drop back to stopped/all-off.
+    old, _, _, _ = _make_engine(num_steps=4)
+    old.handle_realtime("start")
+    old.set_step_enabled(1, True)
+    old.set_step_enabled(3, True)
+    _run_ticks(old, SUBDIVISION_TICKS["16th"] + 1)  # playhead on step 1 (enabled), 1 tick in
+
+    new, daw_messages, _, _ = _make_engine(num_steps=4)
+    new.adopt_runtime_state(old)
+    assert new.running
+    assert new.current_step == old.current_step
+    assert new.step_enabled == [False, True, False, True]
+
+    # keeps counting from the carried-over tick position, no Start needed
+    _run_ticks(new, SUBDIVISION_TICKS["16th"] - 1)
+    assert any(m[0] & 0xF0 == 0x90 for m in daw_messages), "rebuilt engine didn't play on"
+
+
+def test_rebuilt_engine_clamps_to_new_step_count():
+    old, _, _, _ = _make_engine(num_steps=4)
+    old.handle_realtime("start")
+    old.set_step_enabled(3, True)
+    _run_ticks(old, SUBDIVISION_TICKS["16th"] * 3)  # current_step == 3
+
+    new, _, _, _ = _make_engine(num_steps=2)
+    new.adopt_runtime_state(old)
+    assert new.current_step < 2
+    assert len(new.step_enabled) == 2
+
+
+def test_close_sends_pending_note_off():
+    engine, daw_messages, _, _ = _make_engine(num_steps=1)
+    engine.handle_realtime("start")
+    engine.set_step_enabled(0, True)
+    _run_ticks(engine, SUBDIVISION_TICKS["16th"])  # step 0 fires, note-off still pending
+    assert daw_messages[-1][0] & 0xF0 == 0x90
+    engine.close()
+    assert daw_messages[-1][0] & 0xF0 == 0x80, "closing mid-gate left a hanging note"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
     failures = 0

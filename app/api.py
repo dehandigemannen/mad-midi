@@ -456,6 +456,7 @@ class Api:
         session = self._session_for_device(entry.device_id)
         if not session or not session.link.connected:
             return False
+        session.stop_pin_test()
         if not session.link.enter_config_mode():
             return False
         ok = session.link.write_config(entry.to_blob())
@@ -470,6 +471,7 @@ class Api:
         session = self._session_for_device(entry.device_id)
         if not session or not session.link.connected:
             return None
+        session.stop_pin_test()
         if not session.link.enter_config_mode():
             return None
         blob = session.link.read_config()
@@ -487,6 +489,29 @@ class Api:
         session.rebuild_engines(fresh)
         fresh.save()
         return fresh.to_dict()
+
+    # ---- pin test (Test tab) ----------------------------------------------
+
+    def start_pin_test(self, id_: str):
+        entry = config_model.Entry.load(id_)
+        session = self._session_for_device(entry.device_id)
+        if not session or not session.link.connected:
+            return {"ok": False, "error": "device is not connected"}
+        error = session.start_pin_test()
+        return {"ok": error is None, "error": error}
+
+    def stop_pin_test(self, id_: str):
+        entry = config_model.Entry.load(id_)
+        session = self._session_for_device(entry.device_id)
+        if session:
+            session.stop_pin_test()
+        return True
+
+    def test_pin(self, id_: str, pin: int, level: str):
+        """level: "high", "low", or "release" (back to the pin's role)."""
+        entry = config_model.Entry.load(id_)
+        session = self._session_for_device(entry.device_id)
+        return bool(session and session.test_pin(int(pin), level))
 
     # ---- flashing ----------------------------------------------------
 

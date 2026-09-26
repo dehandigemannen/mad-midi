@@ -88,6 +88,33 @@ class SequencerEngine:
         self._off_timers: List[Optional[threading.Timer]] = [None] * len(self._steps)
         self._lock = threading.Lock()
 
+    def adopt_runtime_state(self, old: "SequencerEngine") -> None:
+        """Carries transport position, tempo estimate and the on/off pattern
+        over from the engine this one replaces. DeviceSession rebuilds the
+        engine on every config edit; without this, editing anything while
+        the DAW plays would drop back to stopped/all-off until the next
+        Start."""
+        with old._lock:
+            running = old.running
+            current_step = old.current_step
+            tick_count = old._tick_count
+            last_tick_time = old._last_tick_time
+            avg_tick_interval = old._avg_tick_interval
+            old_enabled = list(old.step_enabled)
+        with self._lock:
+            self.running = running
+            self.current_step = current_step % len(self._steps) if self._steps else 0
+            self._tick_count = min(tick_count, self.ticks_per_step - 1)
+            self._last_tick_time = last_tick_time
+            self._avg_tick_interval = avg_tick_interval
+            for i in range(min(len(old_enabled), len(self.step_enabled))):
+                self.step_enabled[i] = old_enabled[i]
+        # re-light in case a step's enabled_light pin changed in the edit
+        for step, enabled in zip(self._steps, self.step_enabled):
+            if enabled:
+                self._send_cc(step.enabled_light, 127)
+        self._emit_state()
+
     # ---- transport -----------------------------------------------------
 
     def handle_realtime(self, kind: str) -> None:
@@ -189,9 +216,19 @@ class SequencerEngine:
             "running": self.running,
             "current_step": self.current_step,
             "step_enabled": list(self.step_enabled),
+            # None until the first MIDI Clock tick arrives -- lets the UI tell
+            # "DAW isn't sending clock" apart from "clock, but stopped"
+            "bpm": (
+                round(60.0 / (self._avg_tick_interval * TICKS_PER_QUARTER))
+                if self._last_tick_time is not None and self._avg_tick_interval > 0
+                else None
+            ),
         })
 
     def close(self) -> None:
+        # Send any still-pending note-offs now rather than dropping them --
+        # otherwise a rebuild mid-gate leaves the note hanging in the DAW.
         for timer in self._off_timers:
-            if timer is not None:
+            if timer is not None and not timer.finished.is_set():
                 timer.cancel()
+                self._end_step(*timer.args)

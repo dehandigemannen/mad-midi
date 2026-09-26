@@ -18,8 +18,10 @@ static const uint8_t CMD_READ_CONFIG = 0x02;
 static const uint8_t CMD_WRITE_CONFIG = 0x03;
 static const uint8_t CMD_RESUME_RUN = 0x04;
 static const uint8_t CMD_SET_DEVICE_ID = 0x05;
+static const uint8_t CMD_TEST_PIN = 0x06; // payload [pin, level]; level = PIN_TEST_LOW/HIGH/RELEASE/INPUT (roles.h)
+static const uint8_t CMD_READ_PINS = 0x07; // reply = PIN_STATE_SIZE bytes (roles.h)
 
-static const uint8_t FW_VERSION = 1;
+static const uint8_t FW_VERSION = 3; // 2: CMD_TEST_PIN, 3: CMD_READ_PINS + PIN_TEST_INPUT
 
 enum class FrameState : uint8_t { WAIT_START, CMD, LEN_LO, LEN_HI, PAYLOAD, CHECKSUM };
 static FrameState frameState = FrameState::WAIT_START;
@@ -85,6 +87,21 @@ static void handleConfigCommand(uint8_t cmd, const uint8_t* payload, uint16_t le
         uint8_t err[1] = { 1 };
         sendFrame((uint8_t)(CMD_SET_DEVICE_ID | 0xC0), err, 1);
       }
+      break;
+    }
+    case CMD_TEST_PIN: {
+      if (len == 2 && rolesTestPin(payload[0], payload[1])) {
+        sendFrame(CMD_TEST_PIN | 0x80, nullptr, 0);
+      } else {
+        uint8_t err[1] = { 1 };
+        sendFrame((uint8_t)(CMD_TEST_PIN | 0xC0), err, 1);
+      }
+      break;
+    }
+    case CMD_READ_PINS: {
+      uint8_t state[PIN_STATE_SIZE];
+      rolesReadPins(state);
+      sendFrame(CMD_READ_PINS | 0x80, state, PIN_STATE_SIZE);
       break;
     }
     default:

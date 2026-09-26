@@ -651,7 +651,38 @@ button:disabled {
   transition: left 0.05s linear, top 0.05s linear;
 }
 
+.joystick-z {
+  width: 160px;
+}
+
+.joystick-z-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-bottom: 3px;
+}
+
+.joystick-z-value {
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 3px;
+}
+
+.joystick-zbar-centre {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--text-dim);
+}
+
 .joystick-zbar-wrap {
+  position: relative;
   width: 160px;
   height: 10px;
   background: var(--bg-alt);
@@ -661,8 +692,111 @@ button:disabled {
 }
 
 .joystick-zbar-fill {
+  position: absolute;
+  top: 0;
   height: 100%;
-  width: 50%;
+  left: 50%;
+  width: 0;
   background: var(--accent);
-  transition: width 0.05s linear;
+  transition: width 0.05s linear, left 0.05s linear;
 }
+
+/* ---- test view ---- */
+
+#testSettings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding-bottom: 14px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+#testSettings .test-status {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+#testSettings .test-status.error { color: var(--bad); }
+
+#testGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.pin-box.test-pin {
+  width: 70px;
+  height: auto;
+  min-height: 72px;
+  padding: 4px 2px;
+  cursor: default;
+}
+
+.pin-box.test-pin:hover { border-color: var(--border); }
+.pin-box.test-pin.level-high { border-color: var(--good); box-shadow: 0 0 8px var(--good); }
+.pin-box.test-pin.level-low { border-color: var(--text-dim); }
+
+.test-live {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-dim);
+  min-height: 11px;
+}
+
+.test-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+}
+
+.pin-box.live-high .test-dot { background: var(--good); border-color: var(--good); }
+.pin-box.pressed { border-color: var(--warn); box-shadow: 0 0 8px var(--warn); }
+.pin-box.pressed .test-live-text { color: var(--warn); }
+
+.test-abar {
+  width: 56px;
+  height: 5px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.test-abar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+}
+
+.test-btns {
+  display: flex;
+  gap: 2px;
+}
+
+.test-btns button {
+  padding: 1px 4px;
+  font-size: 10px;
+  font-family: var(--mono);
+}
+
+.test-btns button.on { background: var(--accent-dim); border-color: var(--accent); }
+
+/* ---- sequencer clock status ---- */
+
+.seq-clock-status {
+  flex-basis: 100%;
+  padding: 6px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.seq-clock-status.ok { border-color: var(--good); color: var(--good); }
+.seq-clock-status.warn { border-color: var(--warn); color: var(--warn); }

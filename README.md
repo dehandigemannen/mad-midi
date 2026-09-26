@@ -119,6 +119,26 @@ Table/Board views.
   a preset or the device's EEPROM) — only the step count, subdivision,
   channel, notes, and pin assignments are persisted.
 
+## Testing pins
+
+Each device entry has a **Test** tab for checking wiring without any MIDI
+setup:
+
+- **H** / **L** drive a pin high or low (a LED or VU meter check).
+- **In** turns a pin into a pull-up input, for checking a button wired to a
+  pin that doesn't have a button role yet.
+- Click a lit button again to release the pin. **All low** and **Release
+  all** act on every pin at once.
+- Every pin shows its live level. Pins with a button role say "pressed"
+  while held. Analog pins (A0–A15) also show their 0–1023 reading and a
+  bar, so you can sweep a pot or fader and watch it move.
+
+While the tab is open the device is held in config mode, so MIDI is paused
+and pin roles are ignored. Leaving the tab (or reading, writing or flashing)
+returns every tested pin to its configured role. If the app quits mid-test,
+the device times out after 15 seconds and restores the pins on its own.
+Needs firmware version 3 or later, so flash once after updating.
+
 ## Rebuilding the firmware (only needed if you edit `firmware/`)
 
 Requires [PlatformIO](https://platformio.org/) (its CLI, not just the
