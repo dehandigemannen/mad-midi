@@ -15,6 +15,11 @@ CC/Note the firmware already treats as "light_digital"/"light_pwm" input
 DAW exactly like any other device-originated MIDI message. Each step's
 enabled_light pin is driven the same way, but tracks the step's on/off
 state rather than flashing on trigger.
+
+A step's PWM value-meter (mirroring its value control's live CC output) is
+no longer this engine's concern -- see value_mirror.ValueMirrorEngine, which
+generalizes that trick to any encoder_a/pot_cc pin via PinConfig.mirror_pin,
+not just a sequencer step's.
 """
 
 import threading
@@ -22,7 +27,6 @@ import time
 from typing import Callable, List, Optional, Tuple
 
 import config_model
-import protocol
 
 TICKS_PER_QUARTER = 24  # MIDI clock standard: 24 clock messages per quarter note
 SUBDIVISION_TICKS = {
@@ -35,8 +39,6 @@ DEFAULT_TICKS_PER_STEP = SUBDIVISION_TICKS["16th"]
 GATE_FRACTION = 0.5  # Note On lasts this fraction of one step's duration
 DEFAULT_VELOCITY = 100
 FALLBACK_TICK_INTERVAL_S = 60.0 / 120 / TICKS_PER_QUARTER  # seed at ~120bpm until clock arrives
-PWM_METER_START = 64  # start each meter at mid-brightness so both turn directions are visible right away
-PWM_METER_STEP = 3  # brightness change per detent -- ~a third of a full turn (42 clicks) sweeps 0-127
 
 SendBytes = Callable[[bytes], None]
 StateCallback = Callable[[dict], None]
@@ -50,18 +52,7 @@ class _ResolvedStep:
         self.note = step.note
         self.button = _resolve(pins, step.button_pin)
         self.step_light = _resolve(pins, step.step_light_pin)
-        self.pwm = _resolve(pins, step.pwm_pin)
         self.enabled_light = _resolve(pins, step.enabled_light_pin)
-
-        # The PWM meter mirrors whichever CC the encoder is currently
-        # sending — plain or, if a shift group is configured, shifted too.
-        self.encoder_plain: Optional[Tuple[int, int]] = None
-        self.encoder_shifted: Optional[Tuple[int, int]] = None
-        if step.encoder_pin is not None and 0 <= step.encoder_pin < len(pins):
-            enc = pins[step.encoder_pin]
-            self.encoder_plain = (enc.channel, enc.number)
-            if enc.in_min != protocol.NO_SHIFT_PIN:
-                self.encoder_shifted = (enc.out_min, enc.out_max)
 
 
 def _resolve(pins: List[config_model.PinConfig], pin_index: Optional[int]) -> Optional[Tuple[int, int]]:
@@ -97,16 +88,32 @@ class SequencerEngine:
         self._off_timers: List[Optional[threading.Timer]] = [None] * len(self._steps)
         self._lock = threading.Lock()
 
-        # The encoder only ever reports a relative click (CC 1 = one step
-        # CW, 127 = one step CCW) -- there's no such thing as "its current
-        # absolute value" to read back, from the device or from a DAW (a
-        # generic MIDI-mapped CC in a DAW is one-way; getting real value
-        # feedback would mean writing a DAW-specific control-surface
-        # integration). So the pwm meter's brightness is our own running
-        # position, accumulated click-by-click here rather than mirroring
-        # the raw relative value directly (which would barely light up on
-        # a CW click and nearly max out on a single CCW one).
-        self._pwm_value = [PWM_METER_START] * len(self._steps)
+    def adopt_runtime_state(self, old: "SequencerEngine") -> None:
+        """Carries transport position, tempo estimate and the on/off pattern
+        over from the engine this one replaces. DeviceSession rebuilds the
+        engine on every config edit; without this, editing anything while
+        the DAW plays would drop back to stopped/all-off until the next
+        Start."""
+        with old._lock:
+            running = old.running
+            current_step = old.current_step
+            tick_count = old._tick_count
+            last_tick_time = old._last_tick_time
+            avg_tick_interval = old._avg_tick_interval
+            old_enabled = list(old.step_enabled)
+        with self._lock:
+            self.running = running
+            self.current_step = current_step % len(self._steps) if self._steps else 0
+            self._tick_count = min(tick_count, self.ticks_per_step - 1)
+            self._last_tick_time = last_tick_time
+            self._avg_tick_interval = avg_tick_interval
+            for i in range(min(len(old_enabled), len(self.step_enabled))):
+                self.step_enabled[i] = old_enabled[i]
+        # re-light in case a step's enabled_light pin changed in the edit
+        for step, enabled in zip(self._steps, self.step_enabled):
+            if enabled:
+                self._send_cc(step.enabled_light, 127)
+        self._emit_state()
 
     # ---- transport -----------------------------------------------------
 
@@ -182,9 +189,7 @@ class SequencerEngine:
     def handle_incoming_pin_message(self, channel: int, number: int, value: int) -> bool:
         """Called for every MIDI message arriving from the device. Returns
         True if it was a sequencer step's button (consumed — caller must not
-        forward it to the DAW), False otherwise (including an encoder match,
-        which still needs to reach the DAW — it's only observed here to
-        mirror its value onto the step's PWM meter)."""
+        forward it to the DAW), False otherwise."""
         for index, step in enumerate(self._steps):
             if step.button == (channel, number):
                 # The button is a latching switch wired for level (not
@@ -194,14 +199,6 @@ class SequencerEngine:
                 # edge (e.g. a session reconnect while it sits mid-position).
                 self.set_step_enabled(index, value != 0)
                 return True
-            if step.pwm is not None and (step.encoder_plain == (channel, number) or step.encoder_shifted == (channel, number)):
-                # value is a relative click (1 = CW, 127 = CCW, see
-                # ENCODER_A in firmware/src/roles.cpp), not an absolute
-                # position -- accumulate it into one here instead of
-                # forwarding it as-is.
-                delta = PWM_METER_STEP if value == 1 else -PWM_METER_STEP
-                self._pwm_value[index] = max(0, min(127, self._pwm_value[index] + delta))
-                self._send_cc(step.pwm, self._pwm_value[index])
         return False
 
     def set_step_enabled(self, index: int, enabled: bool) -> None:
@@ -219,9 +216,19 @@ class SequencerEngine:
             "running": self.running,
             "current_step": self.current_step,
             "step_enabled": list(self.step_enabled),
+            # None until the first MIDI Clock tick arrives -- lets the UI tell
+            # "DAW isn't sending clock" apart from "clock, but stopped"
+            "bpm": (
+                round(60.0 / (self._avg_tick_interval * TICKS_PER_QUARTER))
+                if self._last_tick_time is not None and self._avg_tick_interval > 0
+                else None
+            ),
         })
 
     def close(self) -> None:
+        # Send any still-pending note-offs now rather than dropping them --
+        # otherwise a rebuild mid-gate leaves the note hanging in the DAW.
         for timer in self._off_timers:
-            if timer is not None:
+            if timer is not None and not timer.finished.is_set():
                 timer.cancel()
+                self._end_step(*timer.args)

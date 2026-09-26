@@ -1,4 +1,5 @@
 #include "mode.h"
+#include "roles.h"
 
 static const uint8_t LED_PIN = 13;
 static const unsigned long CONFIG_TIMEOUT_MS = 15000UL;
@@ -24,6 +25,7 @@ void enterConfigMode() {
 }
 
 void resumeRunMode() {
+  rolesEndPinTest(); // covers both CMD_RESUME_RUN and the config-mode timeout
   currentMode = DeviceMode::RUN;
   digitalWrite(LED_PIN, HIGH);
 }

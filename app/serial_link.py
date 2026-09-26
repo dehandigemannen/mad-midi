@@ -25,6 +25,10 @@ BOOT_SETTLE_S = 1.8
 
 MonitorCallback = Callable[[str, str, bytes], None]  # (direction, kind, raw)
 
+# Polled ~20x/s by the Test tab -- kept out of the monitor so it doesn't
+# drown everything else.
+_UNLOGGED_COMMANDS = {protocol.CMD_READ_PINS}
+
 
 class SerialLink:
     def __init__(self, on_midi_from_device: Callable[[bytes], None],
@@ -40,6 +44,10 @@ class SerialLink:
         self._frame_parser = protocol.FrameParser()
         self._pending_replies: "queue.Queue" = queue.Queue()
         self._write_lock = threading.Lock()
+        # Serializes whole request/reply round-trips: the pin-test keepalive
+        # pings from its own thread, and without this two in-flight commands
+        # could each pick up the other's reply off _pending_replies.
+        self._command_lock = threading.Lock()
         self._connected_at = 0.0
 
     @staticmethod
@@ -136,6 +144,23 @@ class SerialLink:
         cmd, _payload = reply
         return cmd == (protocol.CMD_SET_DEVICE_ID | 0x80)
 
+    def test_pin(self, pin: int, level: int, timeout=DEFAULT_TIMEOUT_S) -> bool:
+        reply = self._send_config_command(protocol.CMD_TEST_PIN, bytes([pin & 0xFF, level & 0xFF]), timeout)
+        if reply is None:
+            return False
+        cmd, _payload = reply
+        return cmd == (protocol.CMD_TEST_PIN | 0x80)
+
+    def read_pins(self, timeout=DEFAULT_TIMEOUT_S):
+        """Returns protocol.parse_pin_state()'s dict, or None."""
+        reply = self._send_config_command(protocol.CMD_READ_PINS, b"", timeout)
+        if reply is None:
+            return None
+        cmd, payload = reply
+        if cmd != (protocol.CMD_READ_PINS | 0x80) or len(payload) != protocol.PIN_STATE_SIZE:
+            return None
+        return protocol.parse_pin_state(payload)
+
     def read_config(self, timeout=DEFAULT_TIMEOUT_S) -> Optional[bytes]:
         reply = self._send_config_command(protocol.CMD_READ_CONFIG, b"", timeout)
         if reply is None:
@@ -156,13 +181,15 @@ class SerialLink:
         if self._mode != "config" or not self.connected:
             return None
         frame = protocol.build_frame(cmd, payload)
-        with self._write_lock:
-            self._ser.write(frame)
-        self._log("out", "ctrl", frame)
-        try:
-            return self._pending_replies.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        with self._command_lock:
+            with self._write_lock:
+                self._ser.write(frame)
+            if cmd not in _UNLOGGED_COMMANDS:
+                self._log("out", "ctrl", frame)
+            try:
+                return self._pending_replies.get(timeout=timeout)
+            except queue.Empty:
+                return None
 
     def _wait_for_mode(self, mode: str, timeout: float) -> bool:
         deadline = time.time() + timeout
@@ -201,7 +228,8 @@ class SerialLink:
             frame = self._frame_parser.feed(b)
             if frame:
                 cmd, payload = frame
-                self._log("in", "ctrl", bytes([cmd]) + payload)
+                if (cmd & 0x3F) not in _UNLOGGED_COMMANDS:
+                    self._log("in", "ctrl", bytes([cmd]) + payload)
                 if cmd == (protocol.CMD_RESUME_RUN | 0x80):
                     self._mode = "run"
                 self._pending_replies.put((cmd, payload))

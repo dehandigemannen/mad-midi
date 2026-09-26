@@ -2,7 +2,7 @@
 #include <Arduino.h>
 
 static const uint8_t PIN_COUNT = 70; // Mega: 0-53 digital, 54-69 = A0-A15
-static const uint8_t CONFIG_FORMAT_VERSION = 4; // bumped: FLAG_ACCEL_ENABLE added
+static const uint8_t CONFIG_FORMAT_VERSION = 6; // bumped: PinConfig grew listenPin (LIGHT_DIGITAL/LIGHT_PWM direct-button-listen support)
 
 enum PinRole : uint8_t {
   ROLE_UNUSED = 0,
@@ -45,9 +45,22 @@ struct PinConfig {
   uint8_t outMin;
   uint8_t outMax;
   uint8_t flags;
+  // ROLE_POT_CC only: shift support, same idea as ENCODER_A's shift fields
+  // above but pots need inMin/inMax/outMin/outMax for their ADC->CC scaling
+  // (see scanPots() in roles.cpp), so there's no spare field to repurpose --
+  // these are dedicated instead.
+  uint8_t shiftPin;     // 0-69 = a pin with ROLE_BUTTON_SHIFT; NO_SHIFT_PIN = none
+  uint8_t shiftChannel; // shifted-state MIDI channel
+  uint8_t shiftNumber;  // shifted-state MIDI CC number
+  // LIGHT_DIGITAL/LIGHT_PWM only: mirror this pin's live button state
+  // directly (0-69, a BUTTON_NOTE/BUTTON_CC/BUTTON_SHIFT pin) instead of
+  // waiting for a matching Note/CC over MIDI -- see applyListenLights() in
+  // roles.cpp. NO_SHIFT_PIN (reused as a generic "no pin" sentinel) = off,
+  // falls back to ordinary Note/CC matching via FLAG_MATCH_CC.
+  uint8_t listenPin;
 };
 
-static const uint8_t RECORD_SIZE = 8;
+static const uint8_t RECORD_SIZE = 12;
 static const uint16_t HEADER_SIZE = 6; // magic(2) + version(1) + pinCount(1) + deviceId(1) + checksum(1)
 static const uint16_t BLOB_SIZE = HEADER_SIZE + (uint16_t)PIN_COUNT * RECORD_SIZE;
 

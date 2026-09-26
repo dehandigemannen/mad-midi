@@ -13,7 +13,7 @@ bool isPinReserved(uint8_t pin) {
 
 void loadDefaultConfig() {
   for (uint8_t i = 0; i < PIN_COUNT; i++) {
-    pinConfigs[i] = (PinConfig){ ROLE_UNUSED, 0, 0, 0, 0, 0, 0, 0 };
+    pinConfigs[i] = (PinConfig){ ROLE_UNUSED, 0, 0, 0, 0, 0, 0, 0, NO_SHIFT_PIN, 0, 0, NO_SHIFT_PIN };
   }
 }
 
@@ -21,7 +21,8 @@ uint8_t computeChecksum() {
   uint16_t sum = 0;
   for (uint8_t i = 0; i < PIN_COUNT; i++) {
     const PinConfig& c = pinConfigs[i];
-    sum = (uint16_t)(sum + c.role + c.channel + c.number + c.inMin + c.inMax + c.outMin + c.outMax + c.flags);
+    sum = (uint16_t)(sum + c.role + c.channel + c.number + c.inMin + c.inMax + c.outMin + c.outMax + c.flags
+                        + c.shiftPin + c.shiftChannel + c.shiftNumber + c.listenPin);
   }
   return (uint8_t)(sum & 0xFF);
 }
@@ -44,6 +45,10 @@ void serializeConfigBlob(uint8_t* buffer) {
     buffer[offset++] = c.outMin;
     buffer[offset++] = c.outMax;
     buffer[offset++] = c.flags;
+    buffer[offset++] = c.shiftPin;
+    buffer[offset++] = c.shiftChannel;
+    buffer[offset++] = c.shiftNumber;
+    buffer[offset++] = c.listenPin;
   }
 }
 
@@ -64,7 +69,12 @@ static bool parseBlobInto(const uint8_t* buffer, uint16_t len, PinConfig* out, u
     out[i].outMin = buffer[offset++];
     out[i].outMax = buffer[offset++];
     out[i].flags = buffer[offset++];
-    sum = (uint16_t)(sum + out[i].role + out[i].channel + out[i].number + out[i].inMin + out[i].inMax + out[i].outMin + out[i].outMax + out[i].flags);
+    out[i].shiftPin = buffer[offset++];
+    out[i].shiftChannel = buffer[offset++];
+    out[i].shiftNumber = buffer[offset++];
+    out[i].listenPin = buffer[offset++];
+    sum = (uint16_t)(sum + out[i].role + out[i].channel + out[i].number + out[i].inMin + out[i].inMax + out[i].outMin + out[i].outMax + out[i].flags
+                        + out[i].shiftPin + out[i].shiftChannel + out[i].shiftNumber + out[i].listenPin);
   }
   if ((uint8_t)(sum & 0xFF) != buffer[5]) return false;
   *outDeviceId = buffer[4];

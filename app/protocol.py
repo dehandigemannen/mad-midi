@@ -6,13 +6,13 @@ no code generation between the two right now.
 import struct
 
 PIN_COUNT = 70  # Mega: 0-53 digital, 54-69 = A0-A15
-CONFIG_FORMAT_VERSION = 4  # bumped: FLAG_ACCEL_ENABLE added
-RECORD_SIZE = 8
+CONFIG_FORMAT_VERSION = 6  # bumped: PinConfig grew listen_pin (LIGHT_DIGITAL/LIGHT_PWM direct-button-listen support)
+RECORD_SIZE = 12
 HEADER_SIZE = 6  # magic(2) + version(1) + pinCount(1) + deviceId(1) + checksum(1)
 BLOB_SIZE = HEADER_SIZE + PIN_COUNT * RECORD_SIZE
 
 RESERVED_PINS = {0, 1, 13}  # USB Serial0 RX/TX, status LED
-NO_SHIFT_PIN = 255  # ENCODER_A in_min sentinel: no shift button assigned
+NO_SHIFT_PIN = 255  # ENCODER_A in_min / POT_CC shift_pin / light listen_pin sentinel: no pin assigned
 
 # --- PinRole ---------------------------------------------------------------
 
@@ -59,6 +59,33 @@ CMD_READ_CONFIG = 0x02
 CMD_WRITE_CONFIG = 0x03
 CMD_RESUME_RUN = 0x04
 CMD_SET_DEVICE_ID = 0x05
+CMD_TEST_PIN = 0x06  # payload [pin, level]; firmware FW_VERSION >= 2 only
+CMD_READ_PINS = 0x07  # reply = PIN_STATE_SIZE bytes; FW_VERSION >= 3 only
+
+# CMD_TEST_PIN levels (firmware/src/roles.h)
+PIN_TEST_LOW = 0
+PIN_TEST_HIGH = 1
+PIN_TEST_RELEASE = 2  # hand the pin back to its configured role
+PIN_TEST_INPUT = 3  # INPUT_PULLUP, for reading a button on a pin with no button role
+PIN_TEST_MIN_FW_VERSION = 3
+
+# CMD_READ_PINS reply (firmware/src/roles.h): digital levels as a bitmask
+# (bit n = pin n), then A0-A15 as little-endian 10-bit analogRead() values.
+PIN_STATE_DIGITAL_BYTES = (PIN_COUNT + 7) // 8
+PIN_STATE_ANALOG_COUNT = 16
+PIN_STATE_SIZE = PIN_STATE_DIGITAL_BYTES + PIN_STATE_ANALOG_COUNT * 2
+
+
+def parse_pin_state(payload: bytes):
+    """Returns {"digital": [bool] * PIN_COUNT, "analog": [int] * 16}."""
+    if len(payload) != PIN_STATE_SIZE:
+        raise ValueError(f"expected {PIN_STATE_SIZE} bytes, got {len(payload)}")
+    digital = [bool(payload[pin // 8] & (1 << (pin % 8))) for pin in range(PIN_COUNT)]
+    analog = [
+        payload[PIN_STATE_DIGITAL_BYTES + i * 2] | (payload[PIN_STATE_DIGITAL_BYTES + i * 2 + 1] << 8)
+        for i in range(PIN_STATE_ANALOG_COUNT)
+    ]
+    return {"digital": digital, "analog": analog}
 
 
 def build_frame(cmd: int, payload: bytes = b"") -> bytes:
@@ -161,12 +188,14 @@ class RunningStatusMidiParser:
 
 # --- EEPROM config blob (de)serialization -----------------------------------
 
-def pack_pin_config(role, channel, number, in_min, in_max, out_min, out_max, flags) -> bytes:
-    return struct.pack("<8B", role, channel, number, in_min, in_max, out_min, out_max, flags)
+def pack_pin_config(role, channel, number, in_min, in_max, out_min, out_max, flags,
+                     shift_pin, shift_channel, shift_number, listen_pin) -> bytes:
+    return struct.pack("<12B", role, channel, number, in_min, in_max, out_min, out_max, flags,
+                        shift_pin, shift_channel, shift_number, listen_pin)
 
 
 def unpack_pin_config(data: bytes):
-    return struct.unpack("<8B", data)
+    return struct.unpack("<12B", data)
 
 
 def build_config_blob(pins, device_id: int = 0) -> bytes:
