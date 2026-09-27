@@ -41,22 +41,23 @@ just re-activate the venv and run that same command.
 
 ## First-time device setup
 
-1. Plug the Mega into USB. In the app's top bar, click the port dropdown
-   (⟳ refreshes the list) and pick the Mega's port — on macOS it looks like
+1. Plug the Mega into USB and click **+ Device** at the bottom of the
+   sidebar. A list of serial ports opens; on macOS the Mega looks like
    `/dev/cu.usbmodem*`.
-2. Click **Connect**. A chip for the device appears in the device bar below
-   the top bar, showing "Unassigned" (no device ID yet) and its current
-   mode.
-3. Click **Flash firmware** with that device selected. This writes the
-   bundled firmware onto the Mega — takes a few seconds. You only need to
-   redo this if the firmware itself changes (not for every pin-config
-   change).
-4. If you plan to run **more than one Mega** at once, give each a
-   persistent ID: type a number into the small field on its device chip and
-   click **Assign ID**. This is stored on the device itself, so it's
-   remembered even if you plug it into a different USB port next time. A
-   single device can skip this — ID `0`/unassigned works fine.
-5. Build your pin mapping in the **Table** or **Board** view (they show the
+2. If the board doesn't have the Mad Midi firmware yet (a new Mega, or one
+   running another sketch), click **Flash** next to its port. This writes
+   the bundled firmware and takes a few seconds.
+3. Click the port name to adopt the board. The app gives it the next free
+   device ID and stores that ID on the board, so it's recognized on any
+   USB port later. It then appears in the sidebar as "Device `<id>`"
+   (use ✎ to rename it). Each device needs an ID, and adopting assigns one
+   automatically; there's nothing to set by hand. After that, a known
+   device reconnects by itself whenever it's plugged in while the app is
+   running.
+
+   Later firmware updates don't need the port list: select the device and
+   click **Flash firmware** in the top bar.
+4. Build your pin mapping in the **Table** or **Board** view (they show the
    same data two ways — pick whichever matches how you think about your
    wiring). Click a pin to open its editor on the right and choose a role:
    - **Button → Note / CC** — wire the button between the pin and GND
@@ -71,11 +72,15 @@ just re-activate the venv and run that same command.
      encoder's editor panel to give the encoder an alternate channel/CC
      while the shift button is held.
    - **Pot/Fader → CC** — analog pins only (A0–A15).
-6. Click **Write to device** to push the config to the selected device's
-   EEPROM. Click **Read from device** any time to pull back whatever is
-   currently stored on it.
-7. Save your work as a named preset (top bar: type a name, **Save**) so you
-   can reload it later or push the same mapping to another device.
+5. Click **Write to device** to push the config to the selected device's
+   EEPROM (the button is highlighted while the app's copy differs from
+   the device's). Click **Read from device** any time to pull back whatever
+   is currently stored on it.
+
+Edits save automatically, including edits made while a device is offline.
+To work on a mapping without a board, click **+ Draft** in the sidebar;
+when it's ready, pick a device under **Apply to:** in the top bar and
+click **Apply**.
 
 ## Using it
 
@@ -96,11 +101,23 @@ all connected devices, decoded and in raw hex — useful for checking a pin
 is actually sending what you expect before you go hunting for a wiring
 mistake.
 
+## Optional features
+
+The top bar has a checkbox for each of **Sequencer**, **Drone**, **FX Rack**
+and **Joystick**. Ticking one adds its tab next to Table/Board; unticking
+hides it again. Each is set per device or draft.
+
+All four tabs work the same way: you pick pins from dropdowns that only
+list free pins, and the app sets those pins' roles, channels and CC/note
+numbers for you. You can still fine-tune them in Table/Board afterwards.
+Because pin roles live on the device, click **Write to device** after
+assigning pins. The feature settings themselves (segment layout, channel)
+are saved in the app, not on the device.
+
 ## Sequencer
 
-Each device entry also has a **Sequencer** tab: an app-side step sequencer
-that drives pins on that device, separate from the pin-role mapping in the
-Table/Board views.
+The **Sequencer** tab is an app-side step sequencer that drives pins on
+the device.
 
 - It's slaved entirely to an external MIDI Clock — there's no internal
   clock, so it stays idle until your DAW sends Start/Stop/Continue and
@@ -115,14 +132,57 @@ Table/Board views.
 - While a device is connected and the DAW's transport is running, the
   step/enabled state streams back live into the UI so you can see the
   sequence advance.
-- The on/off pattern and playback position are runtime-only (not saved to
-  a preset or the device's EEPROM) — only the step count, subdivision,
-  channel, notes, and pin assignments are persisted.
+- The on/off pattern and playback position aren't saved anywhere and reset
+  when the device reconnects. Only the step count, subdivision, channel,
+  notes and pin assignments are saved.
+
+## Drone
+
+The **Drone** tab sets up to 8 drone segments that share one MIDI
+channel. Each segment is a control that only reaches your DAW while the
+segment is switched on:
+
+- **Encoder** or **Pot**: the value control, chosen per segment. It sends
+  CC `8 + n` (segment `n` counts from 0), or CC `16 + n` while its shift
+  button is held.
+- **Enable**: a toggle button that switches the segment on and off. Its
+  own message never reaches the DAW; it only decides whether the
+  control's CC gets through.
+- **Shift**: a button for the control's alternate CC.
+- **PWM (VU meter)**: a PWM pin that shows the control's current value.
+- **On light** / **Shift light**: follow the enable and shift buttons
+  directly on the device, with no MIDI round trip.
+
+A drone never sends notes. While the device is connected, the tab shows
+which segments are on. Every segment starts off when the device connects.
+
+## FX Rack
+
+The **FX Rack** tab works like Drone, but each segment (up to 8) has
+**two encoders** that one **Enable** button turns on and off together.
+Both encoders share one **Shift** button, and the segment has the same
+**On light** / **Shift light**, but no VU meter pin. Encoder 1 sends
+CC `8 + n` (shifted: `16 + n`) and Encoder 2 sends CC `24 + n` (shifted:
+`32 + n`). Pots aren't supported here, only encoders.
+
+## Joystick
+
+The **Joystick** tab maps a single joystick: **X**, **Y** and
+**Rotation** on analog pins (A0–A15) and its **Button** on a digital pin.
+The axes send CC 20, 21 and 22 on channel 1, and the button sends note 60
+(C4). Change these in Table/Board if you need different numbers. Each axis
+has an **Invert direction** box for a stick wired backwards (write to the
+device after changing it). A live dot shows the X/Y position and a
+centre-zero bar shows rotation.
+
+Unlike the other tabs, the joystick has no extra logic behind it. Its pins
+are ordinary pot and button pins, and this tab is a shortcut for setting
+them up together.
 
 ## Testing pins
 
-Each device entry has a **Test** tab for checking wiring without any MIDI
-setup:
+Every device (not drafts) always has a **Test** tab for checking wiring
+without any MIDI setup:
 
 - **H** / **L** drive a pin high or low (a LED or VU meter check).
 - **In** turns a pin into a pull-up input, for checking a button wired to a
@@ -154,9 +214,13 @@ Then **Flash firmware** from the app as usual to push the rebuilt version.
 
 ## Troubleshooting
 
-- **Port doesn't show up**: click ⟳ next to the port dropdown after
-  plugging in; macOS sometimes needs a moment to enumerate a new USB-serial
-  device.
+- **Port doesn't show up**: close the port list and click **+ Device**
+  again to rescan; macOS sometimes needs a moment to enumerate a new
+  USB-serial device. Ports that already belong to a connected device aren't
+  listed.
+- **Port doesn't adopt** ("didn't respond as a Mad Midi device"): the board
+  is running a different sketch or none at all. Click **Flash** next to the
+  port, then click the port again.
 - **Flash fails with a permissions/lock error**: make sure nothing else
   (Arduino IDE Serial Monitor, `screen`, another instance of this app) has
   the port open.
