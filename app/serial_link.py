@@ -32,9 +32,15 @@ _UNLOGGED_COMMANDS = {protocol.CMD_READ_PINS}
 
 class SerialLink:
     def __init__(self, on_midi_from_device: Callable[[bytes], None],
-                 on_monitor: Optional[MonitorCallback] = None):
+                 on_monitor: Optional[MonitorCallback] = None,
+                 on_lost: Optional[Callable[[], None]] = None):
         self._on_midi_from_device = on_midi_from_device
         self._on_monitor = on_monitor
+        # Called once, from whichever thread hit the error, when the port
+        # stops working without disconnect() having been called -- i.e. the
+        # board was unplugged. Not called for a deliberate disconnect().
+        self._on_lost = on_lost
+        self._lost_lock = threading.Lock()
         self._ser: Optional[serial.Serial] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -63,16 +69,50 @@ class SerialLink:
         self._reader_thread.start()
 
     def disconnect(self):
-        self._stop.set()
-        if self._reader_thread:
+        with self._lost_lock:
+            self._stop.set()
+        # on_lost fires on the reader thread, and its handler closes the
+        # session -- which lands back here on that same thread.
+        if self._reader_thread and self._reader_thread is not threading.current_thread():
             self._reader_thread.join(timeout=1.0)
-        if self._ser:
-            self._ser.close()
-        self._ser = None
+        self._close_port()
+
+    def _close_port(self):
+        ser, self._ser = self._ser, None
+        if ser:
+            try:
+                ser.close()
+            except (serial.SerialException, OSError):
+                pass
+
+    def _mark_lost(self):
+        """The port errored out underneath us (board unplugged). Drops it so
+        `connected` goes False, and tells the owner once."""
+        with self._lost_lock:
+            if self._stop.is_set():
+                return  # deliberate disconnect() already underway, or already lost
+            self._stop.set()
+        self._close_port()
+        self._pending_replies.put(None)  # wake a command waiting on a reply that will never come
+        if self._on_lost:
+            self._on_lost()
+
+    def _write(self, data: bytes) -> bool:
+        ser = self._ser  # local: the reader thread may clear self._ser at any moment
+        if ser is None:
+            return False
+        try:
+            with self._write_lock:
+                ser.write(data)
+            return True
+        except (serial.SerialException, OSError):
+            self._mark_lost()
+            return False
 
     @property
     def connected(self) -> bool:
-        return self._ser is not None and self._ser.is_open
+        ser = self._ser
+        return ser is not None and ser.is_open
 
     @property
     def mode(self) -> str:
@@ -83,9 +123,8 @@ class SerialLink:
         drive light/PWM output pins. Only meaningful in RUN mode."""
         if not self.connected or self._mode != "run":
             return
-        with self._write_lock:
-            self._ser.write(raw_bytes)
-        self._log("out", "midi", raw_bytes)
+        if self._write(raw_bytes):
+            self._log("out", "midi", raw_bytes)
 
     def enter_config_mode(self, timeout=DEFAULT_TIMEOUT_S) -> bool:
         """Sends the enter-config SysEx trigger, resending it every
@@ -110,8 +149,8 @@ class SerialLink:
                 return True
             now = time.time()
             if now >= next_send:
-                with self._write_lock:
-                    self._ser.write(protocol.SYSEX_ENTER_CONFIG)
+                if not self._write(protocol.SYSEX_ENTER_CONFIG):
+                    return False
                 self._log("out", "ctrl", protocol.SYSEX_ENTER_CONFIG)
                 next_send = now + RESEND_INTERVAL_S
             time.sleep(0.02)
@@ -182,8 +221,8 @@ class SerialLink:
             return None
         frame = protocol.build_frame(cmd, payload)
         with self._command_lock:
-            with self._write_lock:
-                self._ser.write(frame)
+            if not self._write(frame):
+                return None
             if cmd not in _UNLOGGED_COMMANDS:
                 self._log("out", "ctrl", frame)
             try:
@@ -205,11 +244,15 @@ class SerialLink:
 
     def _read_loop(self):
         while not self._stop.is_set():
-            if not self._ser:
+            ser = self._ser
+            if not ser:
                 break
             try:
-                data = self._ser.read(256)
-            except serial.SerialException:
+                data = ser.read(256)
+            except (serial.SerialException, OSError, TypeError, AttributeError):
+                # TypeError/AttributeError: pyserial's posix read can trip
+                # over its own fd being closed mid-call by _close_port().
+                self._mark_lost()
                 break
             for b in data:
                 self._handle_byte(b)

@@ -376,6 +376,35 @@ class Api:
         session.active_pins = entry.pins
         session.rebuild_engines(entry)
 
+    def _on_session_lost(self, session: "DeviceSession"):
+        """A session's serial port died underneath it (board unplugged).
+        Detaches it so its entry shows offline -- the UI picks that up from
+        its list_entries() poll -- and the auto-reconnect poller can hook the
+        board back up once it's plugged in again. Sessions that aren't
+        attached (a probe mid-identify, or one flash_firmware() already
+        detached) are left to their own caller."""
+        with self._lock:
+            if self._devices.get(session.port) is not session:
+                return
+            self._devices.pop(session.port, None)
+            if self._device_ports.get(session.device_id) == session.port:
+                self._device_ports.pop(session.device_id, None)
+        _log(f"device {session.device_id} on {session.port}: detached, now offline")
+        session.close()
+
+    def _drop_vanished_sessions(self):
+        """Backstop for _on_session_lost(): a board whose port is gone from
+        the OS port list is unplugged, even if its serial link somehow
+        hasn't errored yet."""
+        present = set(serial_link.SerialLink.list_ports())
+        with self._lock:
+            vanished = [
+                s for port, s in self._devices.items()
+                if port not in present and port not in self._busy_ports
+            ]
+        for session in vanished:
+            self._on_session_lost(session)
+
     # ---- background auto-reconnect --------------------------------------
     #
     # Polls for previously-adopted devices coming back online (replugged, or
@@ -391,6 +420,7 @@ class Api:
     # set up on purpose.
 
     def _auto_reconnect_tick(self):
+        self._drop_vanished_sessions()
         with self._lock:
             connected_ports = set(self._devices.keys())
             busy_ports = set(self._busy_ports)

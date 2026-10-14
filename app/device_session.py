@@ -92,6 +92,7 @@ class DeviceSession:
         self.link = serial_link.SerialLink(
             on_midi_from_device=self._on_device_midi,
             on_monitor=self._on_monitor,
+            on_lost=self._on_link_lost,
         )
         self.link.connect(port)
         out_name, in_name = _virtual_port_names(port, self.device_id)
@@ -231,6 +232,10 @@ class DeviceSession:
             if self.sequencer and self.sequencer.handle_incoming_pin_message(channel, d1, d2):
                 return
         self.bridge.send_to_daw(raw)
+
+    def _on_link_lost(self):
+        _log(f"device {self.device_id} on {self.port}: serial link lost (unplugged?)")
+        self._api._on_session_lost(self)
 
     def _on_daw_message(self, raw: bytes):
         self.link.send_midi_to_device(raw)
