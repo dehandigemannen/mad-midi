@@ -1,8 +1,7 @@
 """Standalone checks for gated_segments.GatedSegmentEngine -- the shared
-enable-button-gates-value-pins engine behind Drone and FX Rack. No test
-framework is installed in this project yet, so these are plain functions
-with asserts, each runnable directly and also auto-discoverable if pytest is
-added later.
+enable-state tracker behind Drone and FX Rack. No test framework is
+installed in this project yet, so these are plain functions with asserts,
+each runnable directly and also auto-discoverable if pytest is added later.
 
 Run with: python3 app/tests/test_gated_segments.py
 """
@@ -28,106 +27,52 @@ def _set_enable(pins, pin, channel=9, number=80):
     pins[pin].number = number
 
 
-def _set_encoder(pins, pin, channel=9, number=50, shift_pin=None, shift_number=None):
-    pins[pin].role = "encoder_a"
-    pins[pin].channel = channel
-    pins[pin].number = number
-    pins[pin].in_min = protocol.NO_SHIFT_PIN
-    if shift_pin is not None:
-        pins[pin].in_min = shift_pin
-        pins[pin].out_min = channel
-        pins[pin].out_max = shift_number
-
-
-def test_enable_message_is_always_consumed_and_tracked():
+def test_enable_message_is_tracked():
     pins = _make_pins()
     _set_enable(pins, 5)
-    _set_encoder(pins, 10)
-    engine = GatedSegmentEngine([(5, [10])], pins)
+    engine = GatedSegmentEngine([5], pins)
     assert engine.enabled == [False]
 
-    consumed = engine.handle_incoming_pin_message(channel=9, number=80, value=127)
-    assert consumed is True, "a segment's enable message must never reach the DAW"
+    engine.observe(channel=9, number=80, value=127)
     assert engine.enabled == [True]
 
-    consumed = engine.handle_incoming_pin_message(channel=9, number=80, value=0)
-    assert consumed is True
+    engine.observe(channel=9, number=80, value=0)
     assert engine.enabled == [False]
 
 
-def test_value_pin_suppressed_while_disabled_and_passed_through_while_enabled():
+def test_unrelated_message_changes_nothing():
     pins = _make_pins()
     _set_enable(pins, 5)
-    _set_encoder(pins, 10)
-    engine = GatedSegmentEngine([(5, [10])], pins)
-
-    suppress = engine.handle_incoming_pin_message(channel=9, number=50, value=1)
-    assert suppress is True, "value CC must be suppressed while the segment is disabled"
-
-    engine.handle_incoming_pin_message(channel=9, number=80, value=127)  # enable it
-    passthrough = engine.handle_incoming_pin_message(channel=9, number=50, value=1)
-    assert passthrough is False, "value CC must reach the DAW once the segment is enabled"
-
-
-def test_unrelated_message_returns_false():
-    pins = _make_pins()
-    _set_enable(pins, 5)
-    _set_encoder(pins, 10)
-    engine = GatedSegmentEngine([(5, [10])], pins)
-    assert engine.handle_incoming_pin_message(channel=2, number=99, value=1) is False
-
-
-def test_shifted_destination_gated_same_as_plain():
-    pins = _make_pins()
-    _set_enable(pins, 5)
-    _set_encoder(pins, 10, shift_pin=20, shift_number=60)
-    engine = GatedSegmentEngine([(5, [10])], pins)
-
-    assert engine.handle_incoming_pin_message(channel=9, number=60, value=1) is True, (
-        "the shifted CC must be gated the same as the plain one while disabled"
-    )
-    engine.handle_incoming_pin_message(channel=9, number=80, value=127)  # enable
-    assert engine.handle_incoming_pin_message(channel=9, number=60, value=1) is False
-
-
-def test_multi_value_pin_segment_gates_both_together():
-    # FX Rack's shape: one enable button gates two encoders at once.
-    pins = _make_pins()
-    _set_enable(pins, 5)
-    _set_encoder(pins, 10, number=50)
-    _set_encoder(pins, 20, number=51)
-    engine = GatedSegmentEngine([(5, [10, 20])], pins)
-
-    assert engine.handle_incoming_pin_message(channel=9, number=50, value=1) is True
-    assert engine.handle_incoming_pin_message(channel=9, number=51, value=1) is True
-
-    engine.handle_incoming_pin_message(channel=9, number=80, value=127)  # enable
-
-    assert engine.handle_incoming_pin_message(channel=9, number=50, value=1) is False
-    assert engine.handle_incoming_pin_message(channel=9, number=51, value=1) is False
+    states = []
+    engine = GatedSegmentEngine([5], pins, on_state_change=states.append)
+    engine.observe(channel=2, number=99, value=127)
+    assert engine.enabled == [False]
+    assert states == []
 
 
 def test_multiple_segments_are_independent():
     pins = _make_pins()
     _set_enable(pins, 5, number=80)
-    _set_encoder(pins, 10, number=50)
     _set_enable(pins, 6, number=81)
-    _set_encoder(pins, 11, number=51)
-    engine = GatedSegmentEngine([(5, [10]), (6, [11])], pins)
+    engine = GatedSegmentEngine([5, 6], pins)
 
-    engine.handle_incoming_pin_message(channel=9, number=80, value=127)  # enable segment 0 only
+    engine.observe(channel=9, number=80, value=127)  # enable segment 0 only
     assert engine.enabled == [True, False]
-    assert engine.handle_incoming_pin_message(channel=9, number=50, value=1) is False, "segment 0 enabled"
-    assert engine.handle_incoming_pin_message(channel=9, number=51, value=1) is True, "segment 1 still disabled"
+
+
+def test_unassigned_enable_pin_is_harmless():
+    pins = _make_pins()
+    engine = GatedSegmentEngine([None], pins)
+    engine.observe(channel=0, number=0, value=127)
+    assert engine.enabled == [False]
 
 
 def test_state_change_callback_fires_on_enable_toggle():
     pins = _make_pins()
     _set_enable(pins, 5)
-    _set_encoder(pins, 10)
     states = []
-    engine = GatedSegmentEngine([(5, [10])], pins, on_state_change=states.append)
-    engine.handle_incoming_pin_message(channel=9, number=80, value=127)
+    engine = GatedSegmentEngine([5], pins, on_state_change=states.append)
+    engine.observe(channel=9, number=80, value=127)
     assert states[-1] == [True]
 
 

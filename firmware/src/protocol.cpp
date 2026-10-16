@@ -4,11 +4,17 @@
 #include "pin_config.h"
 #include "roles.h"
 
-// SysEx trigger (valid MIDI, 0x7D = reserved non-commercial/private-use ID):
+// Run-mode SysEx triggers (valid MIDI, 0x7D = reserved non-commercial/private-use ID):
 //   App -> Firmware: F0 7D 01 F7   (enter config mode)
 //   Firmware -> App: F0 7D 02 F7   (ack)
-static const uint8_t TRIGGER_SEQ[4] = { 0xF0, 0x7D, 0x01, 0xF7 };
+//   App -> Firmware: F0 7D 03 F7   (send snapshot, no ack: see rolesSendSnapshot())
+static const uint8_t SYSEX_START = 0xF0;
+static const uint8_t SYSEX_ID = 0x7D;
+static const uint8_t SYSEX_END = 0xF7;
+static const uint8_t TRIGGER_ENTER_CONFIG = 0x01;
+static const uint8_t TRIGGER_SNAPSHOT = 0x03;
 static uint8_t triggerMatchPos = 0;
+static uint8_t triggerCmd = 0;
 
 // Config-mode frame: [0xAA][CMD][LEN_LO][LEN_HI][PAYLOAD x LEN][CHECKSUM]
 // CHECKSUM makes (CMD+LEN_LO+LEN_HI+sum(PAYLOAD)+CHECKSUM) mod 256 == 0.
@@ -21,7 +27,7 @@ static const uint8_t CMD_SET_DEVICE_ID = 0x05;
 static const uint8_t CMD_TEST_PIN = 0x06; // payload [pin, level]; level = PIN_TEST_LOW/HIGH/RELEASE/INPUT (roles.h)
 static const uint8_t CMD_READ_PINS = 0x07; // reply = PIN_STATE_SIZE bytes (roles.h)
 
-static const uint8_t FW_VERSION = 3; // 2: CMD_TEST_PIN, 3: CMD_READ_PINS + PIN_TEST_INPUT
+static const uint8_t FW_VERSION = 5; // 2: CMD_TEST_PIN, 3: CMD_READ_PINS + PIN_TEST_INPUT, 4: snapshot trigger, 5: binary-offset encoder CCs
 
 enum class FrameState : uint8_t { WAIT_START, CMD, LEN_LO, LEN_HI, PAYLOAD, CHECKSUM };
 static FrameState frameState = FrameState::WAIT_START;
@@ -150,16 +156,30 @@ static void feedConfigFrameByte(uint8_t b) {
 }
 
 static void feedRunModeByte(uint8_t b) {
-  if (b == TRIGGER_SEQ[triggerMatchPos]) {
+  bool matched = false;
+  switch (triggerMatchPos) {
+    case 0: matched = (b == SYSEX_START); break;
+    case 1: matched = (b == SYSEX_ID); break;
+    case 2:
+      matched = (b == TRIGGER_ENTER_CONFIG || b == TRIGGER_SNAPSHOT);
+      triggerCmd = b;
+      break;
+    case 3: matched = (b == SYSEX_END); break;
+  }
+  if (matched) {
     triggerMatchPos++;
     if (triggerMatchPos == 4) {
       triggerMatchPos = 0;
-      enterConfigMode();
-      sendSysexAck();
+      if (triggerCmd == TRIGGER_ENTER_CONFIG) {
+        enterConfigMode();
+        sendSysexAck();
+      } else {
+        rolesSendSnapshot();
+      }
     }
     return;
   }
-  triggerMatchPos = (b == TRIGGER_SEQ[0]) ? 1 : 0;
+  triggerMatchPos = (b == SYSEX_START) ? 1 : 0;
   midiParserFeed(b);
 }
 

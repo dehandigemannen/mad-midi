@@ -24,7 +24,7 @@ enum PinFlags : uint8_t {
   // the same number.
   FLAG_MATCH_CC = 1 << 2,
   // ENCODER_A only: scale relative CC step size up the faster the encoder is
-  // turned (see roles.cpp). Unset = fixed 1/127 per detent, unchanged.
+  // turned (see roles.cpp). Unset = fixed 65/63 per detent, unchanged.
   FLAG_ACCEL_ENABLE = 1 << 3,
 };
 

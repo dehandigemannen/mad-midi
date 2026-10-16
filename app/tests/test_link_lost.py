@@ -42,6 +42,10 @@ class FakeSerial:
             raise serial.SerialException("write failed: [Errno 6] Device not configured")
         self.written.append(bytes(data))
 
+    def flush(self):
+        if self.unplugged:
+            raise serial.SerialException("write failed: [Errno 6] Device not configured")
+
     def close(self):
         self.is_open = False
 

@@ -4,3 +4,5 @@ __pycache__/
 firmware/.pio/
 app/presets/*.json
 app/devices/*.json
+build/
+dist/

@@ -1,10 +1,9 @@
 """App-only FX rack engine: one instance per DeviceSession, built from an
 Entry's FxRackConfig (config_model.py) plus its current PinConfig list.
 
-Each segment's enable button gates BOTH of its encoders' CC output from
-reaching the DAW at once -- otherwise identical to Drone's gating, just with
-two value pins per segment instead of one, and no PWM/mirror involvement at
-all. The on/shift lights are driven entirely by firmware's listen_pin
+Same as Drone (see drone.py), just with two encoders per segment and no
+PWM/mirror involvement at all: every CC goes straight to the DAW, and the
+engine only tracks which segments are on for the FX Rack tab's display. The on/shift lights are driven entirely by firmware's listen_pin
 mechanism, same as Drone's.
 """
 
@@ -21,11 +20,13 @@ class FxRackEngine:
         pins: List[config_model.PinConfig],
         on_state_change: Optional[StateCallback] = None,
     ):
-        specs = [(seg.enable_pin, [seg.encoder1_pin, seg.encoder2_pin]) for seg in config.segments]
-        self._gated = GatedSegmentEngine(specs, pins, on_state_change)
+        self._gated = GatedSegmentEngine([seg.enable_pin for seg in config.segments], pins, on_state_change)
 
-    def handle_incoming_pin_message(self, channel: int, number: int, value: int) -> bool:
-        return self._gated.handle_incoming_pin_message(channel, number, value)
+    def observe(self, channel: int, number: int, value: int) -> None:
+        self._gated.observe(channel, number, value)
+
+    def adopt_runtime_state(self, old: "FxRackEngine") -> None:
+        self._gated.adopt_runtime_state(old._gated)
 
     @property
     def enabled(self) -> List[bool]:

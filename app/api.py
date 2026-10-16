@@ -22,6 +22,11 @@ AUTO_PROBE_COOLDOWN_S = 10.0  # don't retry a port that just failed to identify 
 AUTO_PORT_HINT = "usbmodem"  # macOS-only for now (see README) — Mega's native USB CDC port always matches this
 
 
+def _safe_filename(name: str) -> str:
+    cleaned = "".join(c if c.isalnum() or c in " -_." else "_" for c in name).strip()
+    return cleaned or "mad-midi-device"
+
+
 class Api:
     def __init__(self):
         self._window: Optional[webview.Window] = None
@@ -97,6 +102,126 @@ class Api:
                 session.close()
         config_model.Entry.delete(id_)
         return True
+
+    # ---- import / export (JSON files) ----------------------------------
+
+    def export_entries(self, ids):
+        """Asks where to save, then writes the given entries to one JSON
+        file. Returns {"ok": True, "path": ..., "count": n}, or {"ok": False}
+        if the user cancelled the dialog."""
+        entries = [config_model.Entry.load(id_) for id_ in ids]
+        default_name = (
+            f"{_safe_filename(entries[0].nickname)}.json" if len(entries) == 1 else "mad-midi-devices.json"
+        )
+        result = self._window.create_file_dialog(
+            webview.FileDialog.SAVE, save_filename=default_name, file_types=("JSON files (*.json)",)
+        )
+        path = result[0] if isinstance(result, (tuple, list)) else result
+        if not path:
+            return {"ok": False}
+        config_model.write_export_file(path, entries)
+        return {"ok": True, "path": path, "count": len(entries)}
+
+    def choose_import_files(self):
+        """Asks for one or more exported JSON files. Returns {"ok": False} if
+        the user cancelled, else {"ok": True, "paths": [...], "devices":
+        [...], "ports": [...]}: the devices in those files (with "exists"
+        set if that device id is already here, so the UI can ask before
+        import_files() replaces it), and the free ports to link them to."""
+        paths = self._window.create_file_dialog(
+            webview.FileDialog.OPEN, allow_multiple=True, file_types=("JSON files (*.json)",)
+        )
+        if not paths:
+            return {"ok": False}
+        devices = []
+        for path in paths:
+            try:
+                imported = config_model.read_export_file(path)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue  # reported by import_files()
+            for entry in imported:
+                if entry.entry_type == "device" and entry.device_id:
+                    devices.append({
+                        "device_id": entry.device_id,
+                        "nickname": entry.nickname,
+                        "exists": config_model.Entry.exists(str(entry.device_id)),
+                    })
+        return {"ok": True, "paths": list(paths), "devices": devices, "ports": self.list_ports()}
+
+    def import_files(self, paths, replace_existing: bool):
+        """Imports the files picked with choose_import_files(). Devices keep
+        their device id, so a board that already carries that id (e.g. the
+        same Mega moved to another computer) is picked up by the
+        auto-reconnect poller as soon as it's plugged in; a different board
+        can take it over via Connect (force_adopt_port). A device whose id
+        already exists here is replaced if replace_existing, otherwise it
+        comes in as a draft. Drafts always come in as new drafts.
+        Returns {"ids": [...], "errors": [...]}."""
+        ids, errors = [], []
+        for path in paths:
+            try:
+                imported = config_model.read_export_file(path)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                errors.append(f"{path}: {exc}")
+                continue
+            for entry in imported:
+                is_device = entry.entry_type == "device" and entry.device_id
+                if is_device and (replace_existing or not config_model.Entry.exists(str(entry.device_id))):
+                    entry.id = str(entry.device_id)
+                    entry.save()
+                    session = self._session_for_device(entry.device_id)
+                    if session:
+                        session.active_pins = entry.pins
+                        session.rebuild_engines(entry)
+                else:
+                    entry.id = f"draft-{uuid.uuid4().hex[:8]}"
+                    entry.entry_type = "draft"
+                    entry.device_id = 0
+                    entry.save()
+                ids.append(entry.id)
+        return {"ids": ids, "errors": errors}
+
+    def link_imported_device(self, id_: str, port: str):
+        """Links a just-imported device entry to the board on `port` and
+        writes the imported config onto it. A board that already carries
+        this device id is simply connected; any other board is flashed and
+        takes over this device id (force_adopt_port). Returns {"ok": bool,
+        "flashed": bool, "error": str}."""
+        entry = config_model.Entry.load(id_)
+        with self._lock:
+            session = self._session_for_device(entry.device_id)
+            if session is None and port in self._devices:
+                return {"ok": False, "flashed": False, "error": "that port belongs to another connected device"}
+            if session is None:
+                if port in self._busy_ports:
+                    return {"ok": False, "flashed": False, "error": "that port is busy"}
+                self._busy_ports.add(port)  # keeps the auto-reconnect poller off it while we probe
+
+        if session is None:
+            try:
+                probe = DeviceSession(port, self)
+                probe.identify()
+            except Exception as exc:
+                with self._lock:
+                    self._busy_ports.discard(port)
+                return {"ok": False, "flashed": False, "error": f"couldn't open {port} ({exc})"}
+            if probe.device_id == entry.device_id:
+                with self._lock:
+                    self._attach_session(entry, probe)
+                    self._busy_ports.discard(port)
+                session = probe
+            else:
+                probe.close()
+                with self._lock:
+                    self._busy_ports.discard(port)
+                result = self.force_adopt_port(id_, port)
+                return {"ok": result["ok"], "flashed": result["ok"], "error": "" if result["ok"] else result["output"]}
+
+        # Board already had this id (or the auto-reconnect poller got to it
+        # first): just put the imported config on it.
+        if not self.write_device_config(id_):
+            return {"ok": False, "flashed": False, "error": "connected, but writing the config failed; try Write to device"}
+        return {"ok": True, "flashed": False, "error": ""}
 
     def reset_entry_pins(self, id_: str):
         """Wipes an entry's saved buffer back to a blank profile — every pin
@@ -234,6 +359,7 @@ class Api:
         )
         session.active_pins = entry.pins
         session.rebuild_engines(entry)
+        session.request_snapshot()
         return entry.to_dict()
 
     def reconnect_entry(self, id_: str, port: str):
@@ -343,6 +469,7 @@ class Api:
                     if write_ok:
                         session.baseline_pins = entry.pins
                         session.active_pins = entry.pins
+                        session.request_snapshot()
                 else:
                     _log(f"force_adopt_port({id_}, {port}): couldn't re-enter config mode to write config")
             except Exception as exc:
@@ -375,6 +502,7 @@ class Api:
         )
         session.active_pins = entry.pins
         session.rebuild_engines(entry)
+        session.request_snapshot()
 
     def _on_session_lost(self, session: "DeviceSession"):
         """A session's serial port died underneath it (board unplugged).
@@ -494,6 +622,7 @@ class Api:
         if ok:
             session.baseline_pins = entry.pins
             session.active_pins = entry.pins
+            session.request_snapshot()  # roles may have changed
         return ok
 
     def read_device_config(self, id_: str):
@@ -510,6 +639,9 @@ class Api:
             return None
         fresh = config_model.Entry.from_blob(id_, entry.nickname, blob)
         # None of these are part of the EEPROM blob -- preserve them
+        for new_pin, old_pin in zip(fresh.pins, entry.pins):
+            new_pin.mirror_pin = old_pin.mirror_pin
+            new_pin.step_size = old_pin.step_size
         fresh.sequencer = entry.sequencer
         fresh.drone = entry.drone
         fresh.fx_rack = entry.fx_rack
@@ -631,6 +763,7 @@ class Api:
                     if write_ok:
                         new_session.baseline_pins = entry.pins
                         new_session.active_pins = entry.pins
+                        new_session.request_snapshot()
                 else:
                     _log(f"flash_firmware({id_}): couldn't re-enter config mode to write config")
             except Exception as exc:

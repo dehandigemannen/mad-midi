@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import List, Optional
 
 import protocol
+from paths import USER_DATA_DIR
 
-ENTRIES_DIR = Path(__file__).parent / "devices"
+ENTRIES_DIR = USER_DATA_DIR / "devices"
 
 # Superseded by ENTRIES_DIR (one JSON per device/draft, no named-preset
 # library) — left in place only so migrate_legacy_presets() can pick up
 # configs saved before that change.
-LEGACY_PRESETS_DIR = Path(__file__).parent / "presets"
+LEGACY_PRESETS_DIR = USER_DATA_DIR / "presets"
 
 
 @dataclasses.dataclass
@@ -45,6 +46,10 @@ class PinConfig:
     # step's PWM meter always was: a synthetic CC sent to the target pin's
     # own configured channel/number). NO_SHIFT_PIN = off. See value_mirror.py.
     mirror_pin: int = protocol.NO_SHIFT_PIN
+    # encoder_a only: multiply every relative step this encoder sends by
+    # this factor before it reaches the DAW. App-only, like mirror_pin --
+    # see encoder_scaler.py. 1 = unchanged.
+    step_size: int = 1
 
     @property
     def reserved(self) -> bool:
@@ -410,3 +415,36 @@ def migrate_legacy_presets() -> None:
             continue
         draft_id = f"draft-{path.stem}"
         Entry(id=draft_id, entry_type="draft", nickname=d.get("name", path.stem), pins=pins).save()
+
+
+# Export file format: a small envelope around Entry.to_dict() so the file is
+# recognisable and can hold one entry or many. read_export_file() also takes
+# a bare entry dict, i.e. a file copied straight out of ENTRIES_DIR.
+EXPORT_FORMAT = "mad-midi"
+EXPORT_VERSION = 1
+
+
+def write_export_file(path, entries: List["Entry"]) -> None:
+    data = {
+        "format": EXPORT_FORMAT,
+        "version": EXPORT_VERSION,
+        "entries": [e.to_dict() for e in entries],
+    }
+    Path(path).write_text(json.dumps(data, indent=2))
+
+
+def read_export_file(path) -> List["Entry"]:
+    """Raises ValueError (incl. json.JSONDecodeError) for a file that isn't
+    a Mad Midi export."""
+    data = json.loads(Path(path).read_text())
+    if isinstance(data, dict) and data.get("format") == EXPORT_FORMAT:
+        if data.get("version", 1) > EXPORT_VERSION:
+            raise ValueError("exported by a newer version of Mad Midi")
+        raw_entries = data.get("entries", [])
+    elif isinstance(data, dict) and "pins" in data:
+        raw_entries = [data]
+    else:
+        raise ValueError("not a Mad Midi device file")
+    if not raw_entries:
+        raise ValueError("file contains no devices")
+    return [Entry.from_dict(d) for d in raw_entries]

@@ -14,6 +14,7 @@ import config_model
 import protocol
 import serial_link
 from drone import DroneEngine
+from encoder_scaler import EncoderStepScaler
 from fx_rack import FxRackEngine
 from midi_bridge import MidiBridge
 from sequencer import SequencerEngine
@@ -83,6 +84,7 @@ class DeviceSession:
         self.active_pins = None  # list[config_model.PinConfig] once known
         self.baseline_pins = None  # snapshot of what's actually flashed to the device
         self.value_mirror: Optional[ValueMirrorEngine] = None
+        self.encoder_scaler: Optional[EncoderStepScaler] = None
         self.sequencer: Optional[SequencerEngine] = None
         self.drone: Optional[DroneEngine] = None
         self.fx_rack: Optional[FxRackEngine] = None
@@ -127,6 +129,7 @@ class DeviceSession:
 
     def rebuild_engines(self, entry: "config_model.Entry"):
         old_sequencer = self.sequencer
+        old_drone, old_fx_rack = self.drone, self.fx_rack
         if self.drone:
             self.drone.close()
         if self.fx_rack:
@@ -136,7 +139,24 @@ class DeviceSession:
         # encoder_a/pot_cc pin with mirror_pin set gets its VU meter driven
         # regardless of whether it belongs to a plain Table/Board mapping, a
         # disabled Sequencer/Drone, or nothing composite at all.
-        self.value_mirror = ValueMirrorEngine(entry.pins, send_to_device=self.link.send_midi_to_device)
+        binary_offset = (self.fw_version or 0) >= protocol.BINARY_OFFSET_MIN_FW_VERSION
+        self.encoder_scaler = EncoderStepScaler(entry.pins, binary_offset=binary_offset)
+        # A Drone encoder's meter shows turn direction/speed and springs back
+        # to the middle, rather than holding an accumulated position.
+        spring_pins = (
+            [seg.control_pin for seg in entry.drone.segments
+             if seg.control_type == "encoder" and seg.control_pin is not None]
+            if entry.drone.enabled
+            else []
+        )
+        if self.value_mirror:
+            self.value_mirror.close()
+        self.value_mirror = ValueMirrorEngine(
+            entry.pins,
+            send_to_device=self.link.send_midi_to_device,
+            binary_offset=binary_offset,
+            spring_pins=spring_pins,
+        )
         self.sequencer = (
             SequencerEngine(
                 entry.sequencer,
@@ -162,6 +182,12 @@ class DeviceSession:
             if entry.fx_rack.enabled
             else None
         )
+        # Same reason as the sequencer's adopt_runtime_state(): a config edit
+        # mustn't make the tabs forget which segments are switched on.
+        if self.drone and old_drone:
+            self.drone.adopt_runtime_state(old_drone)
+        if self.fx_rack and old_fx_rack:
+            self.fx_rack.adopt_runtime_state(old_fx_rack)
 
     # ---- pin test (Test tab) ---------------------------------------------
     #
@@ -202,6 +228,17 @@ class DeviceSession:
         self._pin_test_stop.set()
         self._pin_test_stop = None
         self.link.resume_run_mode()
+        self.request_snapshot()  # switches may have moved while MIDI was paused
+
+    def request_snapshot(self):
+        """Syncs the app's engines and the DAW with the board's real switch
+        and pot positions. Call once the virtual MIDI port and engines are
+        final (after rebuild_engines()), and after anything that reboots or
+        reconfigures the board: the board sends nothing on its own then, so
+        everyone would otherwise assume "off" until each switch's next edge.
+        Older firmware doesn't know the trigger, so it's skipped there."""
+        if (self.fw_version or 0) >= protocol.SNAPSHOT_MIN_FW_VERSION:
+            self.link.request_snapshot()
 
     def test_pin(self, pin: int, level: str) -> bool:
         if not self.pin_testing or level not in _PIN_TEST_LEVELS:
@@ -210,6 +247,8 @@ class DeviceSession:
 
     def close(self):
         self.stop_pin_test()
+        if self.value_mirror:
+            self.value_mirror.close()
         if self.sequencer:
             self.sequencer.close()
         if self.drone:
@@ -223,12 +262,17 @@ class DeviceSession:
         if len(raw) >= 3:
             channel = raw[0] & 0x0F
             d1, d2 = raw[1], raw[2]
+            if (raw[0] & 0xF0) == 0xB0 and self.encoder_scaler and self.encoder_scaler.active:
+                scaled = self.encoder_scaler.scale(channel, d1, d2)
+                if scaled != d2:
+                    d2 = scaled
+                    raw = bytes([raw[0], d1, d2])
             if self.value_mirror:
                 self.value_mirror.handle_incoming(channel, d1, d2)
-            if self.drone and self.drone.handle_incoming_pin_message(channel, d1, d2):
-                return
-            if self.fx_rack and self.fx_rack.handle_incoming_pin_message(channel, d1, d2):
-                return
+            if self.drone:
+                self.drone.observe(channel, d1, d2)
+            if self.fx_rack:
+                self.fx_rack.observe(channel, d1, d2)
             if self.sequencer and self.sequencer.handle_incoming_pin_message(channel, d1, d2):
                 return
         self.bridge.send_to_daw(raw)
@@ -238,6 +282,8 @@ class DeviceSession:
         self._api._on_session_lost(self)
 
     def _on_daw_message(self, raw: bytes):
+        if self.value_mirror and self.value_mirror.is_meter_message(raw):
+            return  # VU meters are app-driven only; see ValueMirrorEngine.is_meter_message
         self.link.send_midi_to_device(raw)
 
     def _on_realtime(self, kind: str):

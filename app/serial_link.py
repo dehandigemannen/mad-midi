@@ -22,6 +22,15 @@ RESEND_INTERVAL_S = 0.3
 # ready -- so the first send has to wait this out in silence rather than
 # retry into it. 1.8s is comfortably past the observed ~1.5s handoff.
 BOOT_SETTLE_S = 1.8
+# Config frames go out in small chunks with a short pause between them.
+# Empirically, one of the Megas drops bytes when a full 851-byte
+# write_config frame arrives as a single burst: the firmware then sits in
+# its PAYLOAD state waiting for bytes that never come, never replies, and
+# swallows every following command as payload. 32 bytes is half the
+# firmware's 64-byte serial RX buffer; 5ms is longer than those 32 bytes
+# take on the wire at 115200 baud (~2.8ms), so the buffer always drains.
+CONFIG_CHUNK_SIZE = 32
+CONFIG_CHUNK_GAP_S = 0.005
 
 MonitorCallback = Callable[[str, str, bytes], None]  # (direction, kind, raw)
 
@@ -109,6 +118,24 @@ class SerialLink:
             self._mark_lost()
             return False
 
+    def _write_chunked(self, data: bytes) -> bool:
+        """Writes `data` in CONFIG_CHUNK_SIZE pieces, holding the write lock
+        across the whole frame so nothing else can land in the middle of it."""
+        ser = self._ser
+        if ser is None:
+            return False
+        try:
+            with self._write_lock:
+                for i in range(0, len(data), CONFIG_CHUNK_SIZE):
+                    ser.write(data[i:i + CONFIG_CHUNK_SIZE])
+                    ser.flush()
+                    if i + CONFIG_CHUNK_SIZE < len(data):
+                        time.sleep(CONFIG_CHUNK_GAP_S)
+            return True
+        except (serial.SerialException, OSError):
+            self._mark_lost()
+            return False
+
     @property
     def connected(self) -> bool:
         ser = self._ser
@@ -125,6 +152,14 @@ class SerialLink:
             return
         if self._write(raw_bytes):
             self._log("out", "midi", raw_bytes)
+
+    def request_snapshot(self):
+        """Asks the board (run mode only) to send the current state of its
+        buttons/switches and pots; they arrive as ordinary MIDI."""
+        if not self.connected or self._mode != "run":
+            return
+        if self._write(protocol.SYSEX_SNAPSHOT):
+            self._log("out", "ctrl", protocol.SYSEX_SNAPSHOT)
 
     def enter_config_mode(self, timeout=DEFAULT_TIMEOUT_S) -> bool:
         """Sends the enter-config SysEx trigger, resending it every
@@ -221,7 +256,7 @@ class SerialLink:
             return None
         frame = protocol.build_frame(cmd, payload)
         with self._command_lock:
-            if not self._write(frame):
+            if not self._write_chunked(frame):
                 return None
             if cmd not in _UNLOGGED_COMMANDS:
                 self._log("out", "ctrl", frame)

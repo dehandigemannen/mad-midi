@@ -40,14 +40,12 @@ def test_segment_gates_both_encoders_together():
     engine = FxRackEngine(config, pins)
     assert engine.enabled == [False]
 
-    assert engine.handle_incoming_pin_message(channel=9, number=50, value=1) is True
-    assert engine.handle_incoming_pin_message(channel=9, number=51, value=1) is True
+    engine.observe(channel=9, number=50, value=1)  # encoders don't touch the state
+    engine.observe(channel=9, number=51, value=1)
+    assert engine.enabled == [False]
 
-    engine.handle_incoming_pin_message(channel=9, number=80, value=127)
+    engine.observe(channel=9, number=80, value=127)
     assert engine.enabled == [True]
-
-    assert engine.handle_incoming_pin_message(channel=9, number=50, value=1) is False
-    assert engine.handle_incoming_pin_message(channel=9, number=51, value=1) is False
 
 
 def test_unassigned_segment_pins_are_harmless():
@@ -55,7 +53,8 @@ def test_unassigned_segment_pins_are_harmless():
     config = config_model.FxRackConfig(enabled=True, segments=[config_model.FxSegmentConfig()])
     engine = FxRackEngine(config, pins)
     assert engine.enabled == [False]
-    assert engine.handle_incoming_pin_message(channel=0, number=0, value=1) is False
+    engine.observe(channel=0, number=0, value=1)
+    assert engine.enabled == [False]
 
 
 if __name__ == "__main__":

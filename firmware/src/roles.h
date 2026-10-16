@@ -15,6 +15,7 @@ static const uint8_t PIN_STATE_SIZE = PIN_STATE_DIGITAL_BYTES + PIN_STATE_ANALOG
 
 void rolesInit();
 void rolesReconfigure();
+void rolesSendSnapshot(); // sends every CC button's current state and makes pots resend theirs
 void rolesScanInputs();
 void rolesHandleIncomingNote(uint8_t channel, uint8_t note, uint8_t velocity, bool isOn);
 void rolesHandleIncomingCC(uint8_t channel, uint8_t controller, uint8_t value);

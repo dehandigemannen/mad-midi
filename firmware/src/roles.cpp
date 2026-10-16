@@ -239,7 +239,50 @@ void rolesInit()
 
 void rolesReconfigure()
 {
+  // A config write shouldn't flip every toggle button back to off: keep the
+  // latched state of pins that are still toggle CC buttons (rolesInit()
+  // clears it, and only toggle buttons ever set it, so pins that weren't
+  // toggles before stay at 0).
+  uint8_t kept[PIN_COUNT];
+  memcpy(kept, toggleState, sizeof(kept));
   rolesInit();
+  for (uint8_t pin = 0; pin < PIN_COUNT; pin++)
+  {
+    const PinConfig &c = pinConfigs[pin];
+    if (isPinReserved(pin) || c.role != ROLE_BUTTON_CC || !(c.flags & FLAG_TOGGLE))
+      continue;
+    toggleState[pin] = kept[pin];
+    applyListenLights(pin, toggleState[pin] != 0);
+  }
+}
+
+void rolesSendSnapshot()
+{
+  // Nothing here goes out on its own at boot or on connect, so without this
+  // the app and the DAW only learn a switch's position from its next edge.
+  // Note buttons are left out: replaying them would play notes.
+  for (uint8_t pin = 0; pin < PIN_COUNT; pin++)
+  {
+    if (isPinReserved(pin))
+      continue;
+    const PinConfig &c = pinConfigs[pin];
+    if (c.role == ROLE_BUTTON_CC)
+    {
+      uint8_t value;
+      if (c.flags & FLAG_TOGGLE)
+        value = toggleState[pin];
+      else
+      {
+        bool pressed = (c.flags & FLAG_INVERT) ? (rawStable[pin] == HIGH) : (rawStable[pin] == LOW);
+        value = pressed ? 127 : 0;
+      }
+      midiSendCC(c.channel, c.number, value);
+    }
+    else if (c.role == ROLE_POT_CC)
+    {
+      potLastSent[pin] = -1; // scanPots() resends it on the next pass
+    }
+  }
 }
 
 static void handleButtonEdge(uint8_t pin, uint8_t stableLevel)
@@ -360,13 +403,15 @@ static void scanButtonsAndEncoders()
 
       // Step magnitude: 1 unless FLAG_ACCEL_ENABLE is set, in which case it
       // scales with how fast the encoder is being turned (see encoderAccel /
-      // ENC_ACCEL_* above). Capped well under 63 so it always stays a valid
-      // positive two's-complement relative CC value.
+      // ENC_ACCEL_* above). Sent as a binary-offset relative CC, the same
+      // encoding Novation controllers use: 64 = no movement, 65..127 = CW
+      // by (value - 64) steps, 1..63 = CCW by (64 - value) steps. Capped at
+      // 63 so it always stays within 1..127.
       uint16_t multiplier = (c.flags & FLAG_ACCEL_ENABLE) ? (accel >> 8) : 0;
       uint8_t magnitude = (uint8_t)(1 + multiplier);
       if (magnitude > 63)
         magnitude = 63;
-      uint8_t ccValue = pending > 0 ? magnitude : (uint8_t)(128 - magnitude);
+      uint8_t ccValue = pending > 0 ? (uint8_t)(64 + magnitude) : (uint8_t)(64 - magnitude);
 
       uint8_t steps = pending > 0 ? (uint8_t)pending : (uint8_t)(-pending);
       for (uint8_t i = 0; i < steps; i++)

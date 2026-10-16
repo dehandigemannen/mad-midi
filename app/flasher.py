@@ -12,7 +12,9 @@ interface change here.
 import subprocess
 from pathlib import Path
 
-VENDOR_DIR = Path(__file__).parent / "vendor"
+from paths import RESOURCE_DIR
+
+VENDOR_DIR = RESOURCE_DIR / "vendor"
 AVRDUDE_DIR = VENDOR_DIR / "avrdude" / "darwin"
 AVRDUDE_BIN = AVRDUDE_DIR / "avrdude"
 AVRDUDE_CONF = AVRDUDE_DIR / "avrdude.conf"

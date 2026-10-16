@@ -82,6 +82,26 @@ To work on a mapping without a board, click **+ Draft** in the sidebar;
 when it's ready, pick a device under **Apply to:** in the top bar and
 click **Apply**.
 
+## Import / export
+
+**Export…** in the sidebar saves the selected device or draft to a JSON
+file. With **All devices** selected it saves every device and draft into
+one file. Use it for backups or to move configs to another Mac.
+
+**Import…** reads one or more of those files (a file copied straight out
+of the `devices/` folder works too):
+
+- **Devices come back as devices**, with the same device ID. An import
+  window lists each device with a port dropdown: pick the Mega's port and
+  click **Import**. The imported config is written onto that board. If the
+  board isn't that device yet (a different or fresh Mega), it's flashed
+  first and takes over the device's ID, which overwrites what was on it.
+  Choose **Don't connect now** to link it later with **Connect** in the
+  sidebar.
+- If a device with that ID already exists, the app asks first: replace
+  its saved config, or import it as a draft instead.
+- Drafts always come in as new drafts.
+
 ## Using it
 
 Once configured, the Mega runs standalone in **RUN mode** (default on
@@ -95,6 +115,17 @@ each device; hitting **Read from device** / **Write to device** briefly
 switches it into **CONFIG mode** (LED blinks) and back — you don't need to
 do anything else for that. If a device sits in config mode with the app not
 talking to it, it auto-returns to RUN mode after 15 seconds.
+
+**Staying in sync with the hardware.** The Mega restarts every time the
+app connects to it. Once connected (and after **Write to device** or
+leaving the Test tab), the app asks the board for the current position of
+every CC button, switch and pot. The board sends those as normal MIDI, so
+the Sequencer/Drone/FX Rack tabs and your DAW both pick up the real
+positions, and mapped parameters in your DAW jump to match the hardware.
+Toggle buttons start off after the restart, and the DAW is told so.
+**Write to device** no longer resets toggle buttons. Note buttons are never
+replayed. This needs firmware version 4 or later: select each device and
+click **Flash firmware** once after updating the app.
 
 The **MIDI Monitor** at the bottom shows every message in and out, across
 all connected devices, decoded and in raw hex — useful for checking a pin
@@ -139,27 +170,29 @@ the device.
 ## Drone
 
 The **Drone** tab sets up to 8 drone segments that share one MIDI
-channel. Each segment is a control that only reaches your DAW while the
-segment is switched on:
+channel. Each segment is a group of pins around one control:
 
 - **Encoder** or **Pot**: the value control, chosen per segment. It sends
   CC `8 + n` (segment `n` counts from 0), or CC `16 + n` while its shift
   button is held.
-- **Enable**: a toggle button that switches the segment on and off. Its
-  own message never reaches the DAW; it only decides whether the
-  control's CC gets through.
+- **Enable**: a toggle button that sends its own on/off CC `0 + n` to
+  the DAW (127 = on, 0 = off). It doesn't block anything: the control's
+  CC always goes through, so map the enable CC in your DAW to whatever
+  should switch on and off.
 - **Shift**: a button for the control's alternate CC.
 - **PWM (VU meter)**: a PWM pin that shows the control's current value.
 - **On light** / **Shift light**: follow the enable and shift buttons
   directly on the device, with no MIDI round trip.
 
 A drone never sends notes. While the device is connected, the tab shows
-which segments are on. Every segment starts off when the device connects.
+which segments are on (it starts at off when the device connects, until
+the first enable press).
 
 ## FX Rack
 
 The **FX Rack** tab works like Drone, but each segment (up to 8) has
-**two encoders** that one **Enable** button turns on and off together.
+**two encoders** and one **Enable** button that sends its own on/off CC
+`0 + n`. The encoders always send, whether the segment is on or off.
 Both encoders share one **Shift** button, and the segment has the same
 **On light** / **Shift light**, but no VU meter pin. Encoder 1 sends
 CC `8 + n` (shifted: `16 + n`) and Encoder 2 sends CC `24 + n` (shifted:
@@ -198,6 +231,35 @@ and pin roles are ignored. Leaving the tab (or reading, writing or flashing)
 returns every tested pin to its configured role. If the app quits mid-test,
 the device times out after 15 seconds and restores the pins on its own.
 Needs firmware version 3 or later, so flash once after updating.
+
+## Building the app (Mad Midi.app)
+
+To get a standalone app that runs without a venv or Python setup:
+
+```bash
+packaging/build_macos.sh
+```
+
+This produces `dist/Mad Midi.app` plus a zip of it under `dist/` to share.
+It uses the project's `.venv` and installs PyInstaller into it
+(`requirements-build.txt`).
+
+- **Apple Silicon (arm64) only for now.** The script refuses
+  `ARCH=x86_64` / `ARCH=universal2` until Intel support is added (that
+  needs x86_64 builds of `python-rtmidi` and `pyobjc`, either built on an
+  Intel Mac or by setting up a universal2 environment).
+- The app is ad-hoc signed, not notarized, so macOS blocks it the first
+  time with only **Move to Bin** / **Cancel**. Click **Cancel**, then go to
+  **System Settings → Privacy & Security** and click **Open Anyway** next
+  to the Mad Midi message. Or run
+  `xattr -dr com.apple.quarantine "Mad Midi.app"` and open it normally.
+- Flashing still needs Rosetta 2 (see Requirements), since the bundled
+  `avrdude` is x86_64.
+- The built app keeps its device configs in
+  `~/Library/Application Support/Mad Midi/devices/` rather than
+  `app/devices/`, and writes its log to `~/Library/Logs/Mad Midi/mad-midi.log`.
+  To carry over configs from running from source, copy them across:
+  `mkdir -p ~/Library/Application\ Support/Mad\ Midi && cp -R app/devices ~/Library/Application\ Support/Mad\ Midi/`
 
 ## Rebuilding the firmware (only needed if you edit `firmware/`)
 

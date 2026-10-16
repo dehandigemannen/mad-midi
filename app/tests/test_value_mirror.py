@@ -59,7 +59,7 @@ def _make_engine(pins):
 
 
 def test_encoder_turn_accumulates_into_pwm():
-    # The encoder only ever reports a relative click (1 = CW, 127 = CCW),
+    # The encoder only ever reports a relative click (65 = CW, 63 = CCW),
     # never an absolute position, so the PWM meter has to accumulate its own
     # running value rather than mirror the raw click straight through (which
     # would barely light up on a CW click and nearly max out on a single CCW
@@ -67,29 +67,125 @@ def test_encoder_turn_accumulates_into_pwm():
     pins = _make_pins_with_mirror("encoder_a")
     engine, device_messages = _make_engine(pins)
 
-    engine.handle_incoming(channel=9, number=50, value=1)  # CW click
+    engine.handle_incoming(channel=9, number=50, value=65)  # CW click
     assert len(device_messages) == 1, "the PWM pin should have been driven from the accumulated value"
     status, number, value = device_messages[0]
     assert status == 0xB0 | 9
     assert number == 70  # the mirror target pin's configured CC number
     assert value == value_mirror.PWM_METER_START + value_mirror.PWM_METER_STEP
 
-    engine.handle_incoming(channel=9, number=50, value=127)  # CCW click
+    engine.handle_incoming(channel=9, number=50, value=63)  # CCW click
     assert device_messages[-1][2] == value_mirror.PWM_METER_START, "a CCW click should move it back down"
 
 
 def test_accelerated_encoder_turn_scales_pwm_by_magnitude():
-    # FLAG_ACCEL_ENABLE turns can send any magnitude 1..63 (CW) / 65..127
-    # (CCW), not just the plain 1/127 -- the PWM meter must scale by that
+    # FLAG_ACCEL_ENABLE turns can send any magnitude 65..127 (CW) / 1..63
+    # (CCW), not just the plain 65/63 -- the PWM meter must scale by that
     # magnitude too, not treat every non-1 value as a single CCW click.
     pins = _make_pins_with_mirror("encoder_a")
     engine, device_messages = _make_engine(pins)
 
-    engine.handle_incoming(channel=9, number=50, value=5)  # accelerated CW
+    engine.handle_incoming(channel=9, number=50, value=69)  # accelerated CW
     assert device_messages[-1][2] == value_mirror.PWM_METER_START + value_mirror.PWM_METER_STEP * 5
 
-    engine.handle_incoming(channel=9, number=50, value=123)  # accelerated CCW (magnitude 5)
+    engine.handle_incoming(channel=9, number=50, value=59)  # accelerated CCW (magnitude 5)
     assert device_messages[-1][2] == value_mirror.PWM_METER_START
+
+
+def test_old_firmware_twos_complement_still_decoded():
+    # Firmware older than BINARY_OFFSET_MIN_FW_VERSION sends 1 = CW, 127 =
+    # CCW. Read as binary offset, a single CW click would be 63 steps down
+    # and slam the meter to 0.
+    pins = _make_pins_with_mirror("encoder_a")
+    device_messages = []
+    engine = ValueMirrorEngine(pins, send_to_device=device_messages.append, binary_offset=False)
+
+    engine.handle_incoming(channel=9, number=50, value=1)  # CW click
+    assert device_messages[-1][2] == value_mirror.PWM_METER_START + value_mirror.PWM_METER_STEP
+
+    engine.handle_incoming(channel=9, number=50, value=127)  # CCW click
+    assert device_messages[-1][2] == value_mirror.PWM_METER_START
+
+
+def test_daw_messages_for_a_meter_are_recognised():
+    # The meter pin (6) is a light_pwm matching CC 70 on channel 9 once
+    # match_cc is set; a DAW echoing CC 70 back must be caught, anything
+    # else must not.
+    pins = _make_pins_with_mirror("encoder_a")
+    pins[6].match_cc = True
+    engine, _ = _make_engine(pins)
+    assert engine.is_meter_message(bytes([0xB0 | 9, 70, 100]))
+    assert not engine.is_meter_message(bytes([0xB0 | 9, 71, 100])), "other CC"
+    assert not engine.is_meter_message(bytes([0xB0 | 3, 70, 100])), "other channel"
+    assert not engine.is_meter_message(bytes([0x90 | 9, 70, 100])), "a Note can't drive a CC-matched light"
+
+
+def test_daw_notes_for_a_note_matched_meter_are_recognised():
+    pins = _make_pins_with_mirror("encoder_a")
+    pins[6].match_cc = False
+    engine, _ = _make_engine(pins)
+    assert engine.is_meter_message(bytes([0x90 | 9, 70, 100]))
+    assert engine.is_meter_message(bytes([0x80 | 9, 70, 0]))
+    assert not engine.is_meter_message(bytes([0xB0 | 9, 70, 100]))
+
+
+def test_spring_step_eases_back_to_the_middle():
+    start = value_mirror.PWM_METER_START
+    for v in (127, 0, start + 1, start - 1):
+        steps = 0
+        while v != start:
+            nxt = value_mirror.spring_step(v)
+            assert abs(nxt - start) < abs(v - start), "must always get closer to the middle"
+            v = nxt
+            steps += 1
+        assert steps < 100
+
+
+def test_spring_meter_kicks_by_direction_and_returns_to_middle():
+    import time
+    pins = _make_pins_with_mirror("encoder_a")
+    device_messages = []
+    engine = ValueMirrorEngine(pins, send_to_device=device_messages.append, spring_pins=[10])
+
+    engine.handle_incoming(channel=9, number=50, value=65)  # CW click
+    assert device_messages[-1][2] == value_mirror.PWM_METER_START + value_mirror.SPRING_PUSH
+
+    time.sleep(1.5)  # well past the ~0.5s settle time
+    assert device_messages[-1][2] == value_mirror.PWM_METER_START, "must settle back on the middle"
+
+    engine.handle_incoming(channel=9, number=50, value=63)  # CCW click
+    assert device_messages[-1][2] == value_mirror.PWM_METER_START - value_mirror.SPRING_PUSH
+    engine.close()
+
+
+def test_close_stops_the_spring():
+    import time
+    pins = _make_pins_with_mirror("encoder_a")
+    device_messages = []
+    engine = ValueMirrorEngine(pins, send_to_device=device_messages.append, spring_pins=[10])
+    engine.handle_incoming(channel=9, number=50, value=70)
+    engine.close()
+    time.sleep(0.1)
+    count = len(device_messages)
+    time.sleep(0.2)
+    assert len(device_messages) == count, "no more meter updates after close()"
+
+
+def test_pots_and_non_spring_encoders_never_spring():
+    import time
+    pins = _make_pins_with_mirror("pot_cc", control_pin=54)
+    device_messages = []
+    engine = ValueMirrorEngine(pins, send_to_device=device_messages.append, spring_pins=[54])
+    engine.handle_incoming(channel=9, number=50, value=100)
+    time.sleep(0.2)
+    assert [m[2] for m in device_messages] == [100], "a pot's meter must hold its real position"
+
+    pins = _make_pins_with_mirror("encoder_a")
+    device_messages = []
+    engine = ValueMirrorEngine(pins, send_to_device=device_messages.append)
+    engine.handle_incoming(channel=9, number=50, value=65)
+    time.sleep(0.2)
+    assert len(device_messages) == 1, "an encoder without spring keeps its accumulated value"
 
 
 def test_pot_value_mirrors_directly_into_pwm():
@@ -110,7 +206,7 @@ def test_shifted_destination_still_mirrors():
     pins = _make_pins_with_mirror("encoder_a", shift_pin=20)
     engine, device_messages = _make_engine(pins)
 
-    engine.handle_incoming(channel=9, number=60, value=1)  # shifted CC, one CW click
+    engine.handle_incoming(channel=9, number=60, value=65)  # shifted CC, one CW click
     assert len(device_messages) == 1
     assert device_messages[-1][2] == value_mirror.PWM_METER_START + value_mirror.PWM_METER_STEP
 
@@ -120,11 +216,11 @@ def test_pwm_accumulator_clamps_at_bounds():
     engine, device_messages = _make_engine(pins)
 
     for _ in range(100):
-        engine.handle_incoming(channel=9, number=50, value=1)  # CW click
+        engine.handle_incoming(channel=9, number=50, value=65)  # CW click
     assert device_messages[-1][2] == 127, "must clamp at the top instead of wrapping/overflowing"
 
     for _ in range(100):
-        engine.handle_incoming(channel=9, number=50, value=127)  # CCW click
+        engine.handle_incoming(channel=9, number=50, value=63)  # CCW click
     assert device_messages[-1][2] == 0, "must clamp at the bottom instead of wrapping/underflowing"
 
 

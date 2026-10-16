@@ -50,6 +50,13 @@ FLAG_ACCEL_ENABLE = 1 << 3
 
 SYSEX_ENTER_CONFIG = bytes([0xF0, 0x7D, 0x01, 0xF7])
 SYSEX_CONFIG_ACK = bytes([0xF0, 0x7D, 0x02, 0xF7])
+# Run mode, no ack: the board sends every CC button's current state and
+# resends its pots, as ordinary MIDI. FW_VERSION >= 4 only.
+SYSEX_SNAPSHOT = bytes([0xF0, 0x7D, 0x03, 0xF7])
+SNAPSHOT_MIN_FW_VERSION = 4
+# Encoders send binary-offset relative CCs (65 = one CW step, 63 = one CCW
+# step) from FW_VERSION 5; older firmware sends two's complement (1 / 127).
+BINARY_OFFSET_MIN_FW_VERSION = 5
 
 # --- Config-mode frame: [0xAA][CMD][LEN_LO][LEN_HI][PAYLOAD...][CHECKSUM] --
 

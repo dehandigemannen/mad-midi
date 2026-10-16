@@ -151,6 +151,11 @@ button:disabled {
   border-top: 1px solid var(--border);
 }
 
+.sidebar-io {
+  border-top: none;
+  padding-top: 0;
+}
+
 .sidebar-add button {
   flex: 1;
   font-size: 11px;
@@ -800,3 +805,67 @@ button:disabled {
 
 .seq-clock-status.ok { border-color: var(--good); color: var(--good); }
 .seq-clock-status.warn { border-color: var(--warn); color: var(--warn); }
+
+/* ---- import dialog ---- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 18px;
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+}
+
+.modal h3 {
+  margin: 0 0 8px 0;
+  font-size: 15px;
+}
+
+.modal-hint {
+  color: var(--text-dim);
+  margin: 0 0 12px 0;
+  line-height: 1.4;
+}
+
+.modal-row {
+  display: grid;
+  grid-template-columns: 1fr 200px;
+  gap: 4px 10px;
+  align-items: center;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+}
+
+.modal-row-status {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.modal-row-status:empty { display: none; }
+.modal-row-status.good { color: var(--good); }
+.modal-row-status.bad { color: var(--bad); }
+
+.modal-actions button.primary {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}

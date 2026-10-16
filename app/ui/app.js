@@ -42,7 +42,7 @@ const ROLE_FIELDS = {
     "out_max",
     "invert",
   ],
-  encoder_a: ["channel", "number", "accel"], // shift fields are rendered separately, see renderEditor
+  encoder_a: ["channel", "number", "accel", "step_size"], // shift fields are rendered separately, see renderEditor
   encoder_b: [],
   pot_cc: [
     "channel",
@@ -98,6 +98,8 @@ const FIELD_META = {
   invert: { label: "Invert", type: "checkbox" },
   toggle: { label: "Toggle (vs momentary)", type: "checkbox" },
   accel: { label: "Acceleration (faster turns = bigger steps)", type: "checkbox" },
+  // App-only (encoder_scaler.py): multiplies every step before it reaches the DAW.
+  step_size: { label: "Step size (×, app-side)", type: "number", min: 1, max: 16 },
 };
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -858,7 +860,7 @@ function renderEditor() {
   if (p.role === "encoder_a") {
     const hint = document.createElement("div");
     hint.className = "field-hint";
-    hint.textContent = `Uses this pin + pin ${pin + 1} (A/B quadrature). Relative CC (1=CW, 127=CCW per step); with Acceleration on, fast turns send a bigger step value instead of just 1/127.`;
+    hint.textContent = `Uses this pin + pin ${pin + 1} (A/B quadrature). Relative CC, binary offset (65=CW, 63=CCW per step; map it in your DAW as "Relative (Binary Offset)"); with Acceleration on, fast turns send a bigger step (further from 64).`;
     fields.appendChild(hint);
   }
   if (p.role === "button_shift") {
@@ -1379,8 +1381,8 @@ function renderSequencerSteps() {
 // ---- drone: pin assignment + rendering -------------------------------------
 // A drone segment's shape mirrors a sequencer step's control cluster
 // (control/enable/shift/pwm/lights), but behaves differently: it never
-// sends a Note, its enable button just gates whether its value control's CC
-// reaches the DAW (app/gated_segments.py), and its on/shift lights are
+// sends a Note, its enable button is just its own CC to the DAW (nothing is
+// gated, see app/gated_segments.py), and its on/shift lights are
 // wired via listen_pin (assignListenLight) rather than matched CC/Note, so
 // they track the button's physical/toggled state with zero MIDI round-trip.
 
@@ -1504,8 +1506,8 @@ function assignDronePin(segmentIndex, fn, pin) {
         linkMirror(pin, seg.pwm_pin);
       }
     } else if (fn === "enable") {
-      // A drone never sends a Note -- enabling it just gates whether
-      // control_pin's CC reaches the DAW (see app/gated_segments.py).
+      // A drone never sends a Note -- the enable button is just its own CC
+      // to the DAW; the control's CC is never gated (app/gated_segments.py).
       // Toggle mode (not momentary) so the on-light reflects sustained
       // on/off state without holding the button down.
       p.role = "button_cc";
@@ -1644,7 +1646,7 @@ function renderDroneSettings() {
   const hint = document.createElement("div");
   hint.className = "field-hint";
   hint.textContent =
-    "Each segment's enable button toggles whether its value control's CC reaches your DAW — a drone never sends a Note. The on/shift lights mirror their button's physical state directly, with no DAW connection needed.";
+    "Each segment's enable button sends its own on/off CC to your DAW; the value control's CC always goes through. A drone never sends a Note. The on/shift lights mirror their button's physical state directly, with no DAW connection needed.";
   el.appendChild(hint);
 }
 
@@ -1725,8 +1727,8 @@ function renderDroneSegments() {
 }
 
 // ---- fx rack: pin assignment + rendering -----------------------------------
-// Each segment is always two encoders + one enable button (gating both at
-// once) + one shared shift button + on/shift lights -- no PWM meter.
+// Each segment is always two encoders + one enable button (its own on/off
+// CC, nothing gated) + one shared shift button + on/shift lights -- no PWM meter.
 
 const FX_BASE = { enable: 0, encoder1: 8, encoder1_shifted: 16, encoder2: 24, encoder2_shifted: 32 };
 const FX_MAX_SEGMENTS = 8;
@@ -1812,7 +1814,7 @@ function assignFxPin(segmentIndex, fn, pin) {
         p.out_max = shiftedBase + segmentIndex;
       }
     } else if (fn === "enable") {
-      // Gates BOTH encoders' CC from reaching the DAW at once (see
+      // Its own on/off CC to the DAW; the encoders are never gated (see
       // app/gated_segments.py) -- toggle mode, same as Drone's.
       p.role = "button_cc";
       p.toggle = true;
@@ -1931,7 +1933,7 @@ function renderFxRackSettings() {
   const hint = document.createElement("div");
   hint.className = "field-hint";
   hint.textContent =
-    "Each segment always has two encoders. Its enable button gates both encoders' CC from reaching your DAW at once; the on/shift lights mirror their button's physical state directly.";
+    "Each segment always has two encoders. Its enable button sends its own on/off CC to your DAW, and both encoders always send; the on/shift lights mirror their button's physical state directly.";
   el.appendChild(hint);
 }
 
@@ -2641,6 +2643,185 @@ async function createDraft(defaultName = "Untitled draft") {
   await selectEntry(entry.id);
 }
 
+async function exportEntries() {
+  const ids =
+    state.selectedId === ALL_DEVICES_ID ? sortedEntries().map((e) => e.id) : state.selectedId ? [state.selectedId] : [];
+  if (!ids.length) {
+    alert("Nothing to export: select a device or draft first.");
+    return;
+  }
+  try {
+    const result = await api("export_entries", ids);
+    if (result.ok) alert(`Exported ${result.count === 1 ? "1 config" : result.count + " configs"} to:\n${result.path}`);
+  } catch (err) {
+    alert("Export failed: " + err);
+  }
+}
+
+async function importEntries() {
+  let picked;
+  try {
+    picked = await api("choose_import_files");
+  } catch (err) {
+    alert("Import failed: " + err);
+    return;
+  }
+  if (!picked.ok) return;
+
+  let replace = false;
+  const conflicts = picked.devices.filter((d) => d.exists);
+  if (conflicts.length) {
+    replace = confirm(
+      "These devices already exist here:\n" +
+        conflicts.map((d) => `${d.nickname} (#${d.device_id})`).join("\n") +
+        "\n\nOK replaces their saved config with the imported one. Cancel imports them as drafts instead."
+    );
+  }
+  const devices = picked.devices.filter((d) => replace || !d.exists);
+
+  if (!devices.length) {
+    if (await finishImport(picked.paths, replace, {})) alert("Imported as drafts.");
+    return;
+  }
+  showImportDialog(picked, replace, devices);
+}
+
+// Per-device port picker shown while importing. Each imported device can be
+// linked to a port right away; linking writes the imported config onto that
+// board (flashing it first if it doesn't carry this device's id yet).
+function showImportDialog(picked, replace, devices) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const box = document.createElement("div");
+  box.className = "modal";
+  overlay.appendChild(box);
+
+  const title = document.createElement("h3");
+  title.textContent = "Import devices";
+  box.appendChild(title);
+
+  const hint = document.createElement("p");
+  hint.className = "modal-hint";
+  hint.textContent = picked.ports.length
+    ? "Pick the port of the Mega for each device. The imported config is written onto that board. " +
+      "A board that isn't this device yet gets flashed first."
+    : "No free ports found. Plug in the Mega(s) and import again, or import now and use Connect later.";
+  box.appendChild(hint);
+
+  const rows = devices.map((d) => {
+    const row = document.createElement("div");
+    row.className = "modal-row";
+    const name = document.createElement("span");
+    name.className = "modal-row-name";
+    name.textContent = `${d.nickname} (#${d.device_id})`;
+    row.appendChild(name);
+
+    const select = document.createElement("select");
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "Don't connect now";
+    select.appendChild(none);
+    picked.ports.forEach((port) => {
+      const opt = document.createElement("option");
+      opt.value = port;
+      opt.textContent = port.split("/").pop();
+      select.appendChild(opt);
+    });
+    row.appendChild(select);
+
+    const status = document.createElement("span");
+    status.className = "modal-row-status";
+    row.appendChild(status);
+
+    box.appendChild(row);
+    return { device: d, select, status };
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "modal-actions";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", () => overlay.remove());
+  const importBtn = document.createElement("button");
+  importBtn.className = "primary";
+  importBtn.textContent = "Import";
+  actions.append(cancelBtn, importBtn);
+  box.appendChild(actions);
+
+  importBtn.addEventListener("click", async () => {
+    const chosen = rows.filter((r) => r.select.value).map((r) => r.select.value);
+    if (new Set(chosen).size !== chosen.length) {
+      alert("Each port can only be linked to one device.");
+      return;
+    }
+    importBtn.disabled = cancelBtn.disabled = true;
+    rows.forEach((r) => (r.select.disabled = true));
+    importBtn.textContent = "Importing…";
+
+    const ports = {};
+    rows.forEach((r) => {
+      if (r.select.value) ports[r.device.device_id] = r.select.value;
+    });
+    const ok = await finishImport(picked.paths, replace, ports, (deviceId, text, cls) => {
+      const r = rows.find((x) => x.device.device_id === deviceId);
+      if (r) {
+        r.status.textContent = text;
+        r.status.className = "modal-row-status " + (cls || "");
+      }
+    });
+
+    importBtn.hidden = true;
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = "Close";
+    if (ok) {
+      const done = document.createElement("p");
+      done.className = "modal-hint";
+      done.textContent = "Done.";
+      box.insertBefore(done, actions);
+    }
+  });
+
+  document.body.appendChild(overlay);
+}
+
+// Imports the files, then links each device in `ports` ({device_id: port}).
+// onStatus(deviceId, text, cssClass) reports per-device progress. Returns
+// false if anything failed (already reported to the user).
+async function finishImport(paths, replace, ports, onStatus = () => {}) {
+  let result;
+  try {
+    result = await api("import_files", paths, replace);
+  } catch (err) {
+    alert("Import failed: " + err);
+    return false;
+  }
+  await refreshEntries();
+  if (result.ids.length) await selectEntry(result.ids[0]);
+
+  let allOk = !result.errors.length;
+  for (const [deviceId, port] of Object.entries(ports)) {
+    const id = String(deviceId);
+    onStatus(Number(deviceId), "Connecting… (flashing can take ~20 s)");
+    let link;
+    try {
+      link = await api("link_imported_device", id, port);
+    } catch (err) {
+      link = { ok: false, error: String(err) };
+    }
+    if (link.ok) {
+      onStatus(Number(deviceId), link.flashed ? "✓ Flashed and connected" : "✓ Connected", "good");
+    } else {
+      allOk = false;
+      onStatus(Number(deviceId), "✗ " + link.error, "bad");
+    }
+    await refreshEntries();
+  }
+
+  if (result.errors.length) alert("Couldn't import:\n" + result.errors.join("\n"));
+  if (state.selectedId) await selectEntry(state.selectedId);
+  return allOk;
+}
+
 async function draftFromPort(port) {
   const base = port.split("/").pop();
   await createDraft(`Draft (${base})`);
@@ -2845,7 +3026,7 @@ function renderHeader() {
     const devices = state.entries.filter((e) => e.entry_type === "device");
     if (devices.length === 0) {
       const opt = document.createElement("option");
-      opt.textContent = "(no devices adopted yet)";
+      opt.textContent = "(no devices yet: connect the Mega with + Device first)";
       select.appendChild(opt);
       select.disabled = true;
     } else {
@@ -3063,6 +3244,8 @@ function renderAll() {
 function initEventListeners() {
   document.getElementById("addDeviceBtn").addEventListener("click", toggleAddDevicePicker);
   document.getElementById("addDraftBtn").addEventListener("click", () => createDraft());
+  document.getElementById("importBtn").addEventListener("click", importEntries);
+  document.getElementById("exportBtn").addEventListener("click", exportEntries);
 
   document.getElementById("clearMonitorBtn").addEventListener("click", () => {
     document.getElementById("monitorLog").innerHTML = "";
