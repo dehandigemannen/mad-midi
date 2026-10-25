@@ -11,6 +11,7 @@ import serial
 import serial.tools.list_ports
 
 import protocol
+from device_pacer import DeviceMidiPacer
 
 BAUD_RATE = 115200
 DEFAULT_TIMEOUT_S = 5.0
@@ -64,6 +65,7 @@ class SerialLink:
         # could each pick up the other's reply off _pending_replies.
         self._command_lock = threading.Lock()
         self._connected_at = 0.0
+        self._pacer: Optional[DeviceMidiPacer] = None
 
     @staticmethod
     def list_ports():
@@ -74,6 +76,8 @@ class SerialLink:
         self._connected_at = time.time()  # see BOOT_SETTLE_S in enter_config_mode()
         self._stop.clear()
         self._mode = "run"
+        self._pacer = DeviceMidiPacer(self._write_midi_now)
+        self._pacer.start()
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
 
@@ -87,6 +91,9 @@ class SerialLink:
         self._close_port()
 
     def _close_port(self):
+        pacer, self._pacer = self._pacer, None
+        if pacer:
+            pacer.stop()
         ser, self._ser = self._ser, None
         if ser:
             try:
@@ -147,7 +154,17 @@ class SerialLink:
 
     def send_midi_to_device(self, raw_bytes: bytes):
         """Send a decoded MIDI message (e.g. from the DAW) to the Arduino, to
-        drive light/PWM output pins. Only meaningful in RUN mode."""
+        drive light/PWM output pins. Only meaningful in RUN mode. Queued
+        through DeviceMidiPacer rather than written straight away -- see
+        device_pacer.py for why."""
+        if not self.connected or self._mode != "run":
+            return
+        pacer = self._pacer
+        if pacer:
+            pacer.submit(raw_bytes)
+
+    def _write_midi_now(self, raw_bytes: bytes):
+        # re-checked: the mode may have flipped while this sat in the queue
         if not self.connected or self._mode != "run":
             return
         if self._write(raw_bytes):

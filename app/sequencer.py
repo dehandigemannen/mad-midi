@@ -39,6 +39,10 @@ DEFAULT_TICKS_PER_STEP = SUBDIVISION_TICKS["16th"]
 GATE_FRACTION = 0.5  # Note On lasts this fraction of one step's duration
 DEFAULT_VELOCITY = 100
 FALLBACK_TICK_INTERVAL_S = 60.0 / 120 / TICKS_PER_QUARTER  # seed at ~120bpm until clock arrives
+# Gaps longer than this (~20bpm) aren't a tempo, they're the DAW having
+# paused its clock while stopped. Averaging one in would stretch the next
+# steps' gates to seconds, leaving their lights and notes hanging.
+MAX_TICK_INTERVAL_S = 60.0 / 20 / TICKS_PER_QUARTER
 
 SendBytes = Callable[[bytes], None]
 StateCallback = Callable[[dict], None]
@@ -119,6 +123,8 @@ class SequencerEngine:
 
     def handle_realtime(self, kind: str) -> None:
         """kind is one of "start", "stop", "continue", "clock"."""
+        if kind == "stop":
+            self._all_step_lights_off()
         with self._lock:
             if kind == "start":
                 self.current_step = 0
@@ -139,7 +145,7 @@ class SequencerEngine:
         now = time.monotonic()
         if self._last_tick_time is not None:
             interval = now - self._last_tick_time
-            if interval > 0:
+            if 0 < interval <= MAX_TICK_INTERVAL_S:
                 self._avg_tick_interval = 0.8 * self._avg_tick_interval + 0.2 * interval
         self._last_tick_time = now
 
@@ -156,9 +162,16 @@ class SequencerEngine:
     # ---- step playback ---------------------------------------------------
 
     def _trigger_step(self, index: int) -> None:
-        if not self.step_enabled[index]:
-            return
         step = self._steps[index]
+        # Re-assert the enabled light on every pass. A CC can get lost on the
+        # serial line to the Mega; without this a light that missed its
+        # update stays wrong until the switch is flipped again.
+        self._send_cc(step.enabled_light, 127 if self.step_enabled[index] else 0)
+        if not self.step_enabled[index]:
+            # Nothing to play, but still send an off: a light left on by an
+            # earlier trigger (or a missed off) gets cleared every pass.
+            self._send_cc(step.step_light, 0)
+            return
         note_on = bytes([0x90 | self.channel, step.note & 0x7F, DEFAULT_VELOCITY])
         note_off = bytes([0x80 | self.channel, step.note & 0x7F, 0])
         self._send_to_daw(note_on)
@@ -176,6 +189,12 @@ class SequencerEngine:
     def _end_step(self, index: int, note_off: bytes, step: _ResolvedStep) -> None:
         self._send_to_daw(note_off)
         self._send_cc(step.step_light, 0)
+
+    def _all_step_lights_off(self) -> None:
+        # Pending gate timers still send their own note-offs; this only makes
+        # sure no step light outlives the transport.
+        for step in self._steps:
+            self._send_cc(step.step_light, 0)
 
     def _send_cc(self, target: Optional[Tuple[int, int]], value: int) -> None:
         if target is None:
@@ -206,6 +225,9 @@ class SequencerEngine:
             return
         with self._lock:
             self.step_enabled[index] = enabled
+        if not enabled:
+            # Don't leave a step light lit until its gate timer ends
+            self._send_cc(self._steps[index].step_light, 0)
         self._send_cc(self._steps[index].enabled_light, 127 if enabled else 0)
         self._emit_state()
 

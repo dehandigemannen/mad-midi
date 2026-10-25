@@ -21,6 +21,7 @@ def _make_engine(
     num_steps=2,
     button_pins=None,
     enabled_light_pins=None,
+    step_light_pins=None,
 ):
     steps = []
     for i in range(num_steps):
@@ -29,6 +30,8 @@ def _make_engine(
             step.button_pin = button_pins[i]
         if enabled_light_pins and i in enabled_light_pins:
             step.enabled_light_pin = enabled_light_pins[i]
+        if step_light_pins and i in step_light_pins:
+            step.step_light_pin = step_light_pins[i]
         steps.append(step)
     config = config_model.SequencerConfig(channel=9, subdivision=subdivision, steps=steps)
 
@@ -42,6 +45,10 @@ def _make_engine(
         pins[pin_index].role = "light_digital"
         pins[pin_index].channel = 9
         pins[pin_index].number = 90 + i
+    for i, pin_index in (step_light_pins or {}).items():
+        pins[pin_index].role = "light_digital"
+        pins[pin_index].channel = 9
+        pins[pin_index].number = 80 + i
 
     daw_messages = []
     device_messages = []
@@ -204,6 +211,52 @@ def test_close_sends_pending_note_off():
     assert daw_messages[-1][0] & 0xF0 == 0x90
     engine.close()
     assert daw_messages[-1][0] & 0xF0 == 0x80, "closing mid-gate left a hanging note"
+
+
+def test_disabled_step_still_sends_step_light_off():
+    engine, daw_messages, device_messages, _ = _make_engine(num_steps=1, step_light_pins={0: 20})
+    engine.handle_realtime("start")
+    _run_ticks(engine, SUBDIVISION_TICKS["16th"])
+    assert daw_messages == []
+    assert device_messages == [bytes([0xB0 | 9, 80, 0])]
+
+
+def test_stop_turns_step_lights_off():
+    engine, _, device_messages, _ = _make_engine(num_steps=2, step_light_pins={0: 20, 1: 21})
+    engine.handle_realtime("start")
+    engine.handle_realtime("stop")
+    assert bytes([0xB0 | 9, 80, 0]) in device_messages
+    assert bytes([0xB0 | 9, 81, 0]) in device_messages
+
+
+def test_clock_pause_does_not_stretch_gate():
+    import sequencer
+    engine, _, _, _ = _make_engine(num_steps=1)
+    _run_ticks(engine, 3)
+    before = engine._avg_tick_interval
+    engine._last_tick_time -= 30  # DAW stopped sending clock for 30s
+    _run_ticks(engine, 1)
+    assert engine._avg_tick_interval <= sequencer.MAX_TICK_INTERVAL_S
+    assert engine._avg_tick_interval <= before * 1.01
+
+
+def test_disabling_step_turns_its_step_light_off_immediately():
+    engine, _, device_messages, _ = _make_engine(num_steps=1, step_light_pins={0: 20})
+    engine.set_step_enabled(0, True)
+    engine.handle_realtime("start")
+    _run_ticks(engine, SUBDIVISION_TICKS["16th"])  # step light on, gate pending
+    assert device_messages[-1] == bytes([0xB0 | 9, 80, 127])
+    engine.set_step_enabled(0, False)
+    assert device_messages[-1] == bytes([0xB0 | 9, 80, 0])
+
+
+def test_enabled_light_reasserted_on_every_pass():
+    engine, _, device_messages, _ = _make_engine(num_steps=1, enabled_light_pins={0: 20})
+    engine.set_step_enabled(0, False)
+    device_messages.clear()  # pretend that off got lost on the serial line
+    engine.handle_realtime("start")
+    _run_ticks(engine, SUBDIVISION_TICKS["16th"])
+    assert bytes([0xB0 | 9, 90, 0]) in device_messages
 
 
 if __name__ == "__main__":

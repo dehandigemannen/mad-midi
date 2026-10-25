@@ -87,6 +87,7 @@ def test_unplug_seen_on_write_reports_lost_without_raising():
     link._stop.clear()
     link._ser.unplug()
     link.send_midi_to_device(b"\x90\x3c\x7f")  # must not raise into the DAW callback
+    assert _wait_until(lambda: calls), "on_lost never fired"
     assert calls == [1]
     assert not link.connected
 
